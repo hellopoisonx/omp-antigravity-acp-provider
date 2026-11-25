@@ -1,22 +1,21 @@
-import type { McpServer as AcpMcpServer } from "@agentclientprotocol/sdk/unstable";
 import type { Tool } from "@earendil-works/pi-ai";
-import {
-	CallToolRequestSchema,
-	ListToolsRequestSchema,
-	type CallToolResult,
-} from "@modelcontextprotocol/sdk/types.js";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { timingSafeEqual } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { Value } from "typebox/value";
 
-import { AntigravityAcpError } from "../acp/errors.js";
-import { PACKAGE_VERSION, PERMISSION_TOOL_NAME } from "../constants.js";
+import { PERMISSION_TOOL_NAME } from "../constants.js";
 import { projectToolSchema } from "./schema.js";
 
-const BODY_LIMIT = 1024 * 1024;
-const DEFAULT_PROGRESS_KEEPALIVE_MS = 15_000;
+/**
+ * agy holds every MCP tool it loads in one customization budget of roughly
+ * 20,000 tokens, counted as ceil(UTF-8 bytes / 3), and drops whole tools past
+ * it. Fitting trims only description prose, so every tool keeps its name,
+ * schema keys, types, enums, required list and bounds.
+ */
+export const TOOL_TOKEN_BUDGET = 18_000;
+const MIN_DESCRIPTION_BYTES = 24;
+/** agy 1.3.5+: a tools/list entry carrying this marker is never deferred out of
+ * the model's function list. */
+const ALWAYS_LOAD = "antigravity/alwaysLoad";
 
 interface BridgeTool {
 	mcpName: string;
@@ -24,6 +23,14 @@ interface BridgeTool {
 	description: string;
 	inputSchema: Record<string, unknown>;
 	originalSchema: Tool["parameters"];
+}
+
+/** One tools/list entry as serialized toward agy. */
+export interface BridgeToolListing {
+	name: string;
+	description: string;
+	inputSchema: Record<string, unknown>;
+	_meta: Record<string, unknown>;
 }
 
 export interface PiToolInvocation {
@@ -35,7 +42,6 @@ export interface PiToolInvocation {
 export interface PiMcpBridgeOptions {
 	tools: readonly Tool[];
 	onCall: (invocation: PiToolInvocation) => Promise<CallToolResult>;
-	progressKeepaliveMs?: number;
 }
 
 export interface ToolOmission {
@@ -59,13 +65,18 @@ export function planToolProjection(tools: readonly Tool[]): ToolOmission[] {
 	return omissions;
 }
 
+export const projectedMcpName = (name: string): string =>
+	`pi_${name}`.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
+
+/**
+ * The OMP tool catalog as agy must list it: every tool marked always-load and
+ * the whole set fitted inside agy's per-session tool budget.
+ */
 export class PiMcpBridge {
 	readonly fingerprint: string;
 	readonly omissions: ToolOmission[] = [];
-	private readonly token = crypto.randomUUID().replaceAll("-", "");
 	private readonly tools: BridgeTool[];
-	private server: ReturnType<typeof createServer> | undefined;
-	private url: string | undefined;
+	private listingCache: BridgeToolListing[] | undefined;
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
 		this.tools = projectTools(options.tools, this.omissions);
@@ -76,130 +87,100 @@ export class PiMcpBridge {
 		return this.tools.length === 0;
 	}
 
-	async start(): Promise<AcpMcpServer | undefined> {
-		if (this.empty) return undefined;
-		if (this.server && this.url) return this.descriptor();
-		this.server = createServer((request, response) => {
-			void this.handle(request, response).catch(() => {
-				if (!response.headersSent) response.writeHead(500, { "content-type": "application/json" });
-				response.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "MCP bridge error" } }));
-			});
-		});
-		this.server.maxConnections = 64;
-		await new Promise<void>((resolve, reject) => {
-			this.server?.once("error", reject);
-			this.server?.listen(0, "127.0.0.1", resolve);
-		});
-		const address = this.server.address();
-		if (!address || typeof address === "string") throw new AntigravityAcpError("spawn", "MCP bridge failed to bind");
-		this.url = `http://127.0.0.1:${address.port}/mcp`;
-		return this.descriptor();
+	get projectedToolNames(): readonly string[] {
+		return this.tools.map((tool) => tool.piName);
 	}
 
-	async close(): Promise<void> {
-		const server = this.server;
-		this.server = undefined;
-		this.url = undefined;
-		if (!server) return;
-		await new Promise<void>((resolve) => {
-			server.close(() => resolve());
-			server.closeAllConnections?.();
-		});
+	listing(): BridgeToolListing[] {
+		return (this.listingCache ??= fitToolsToBudget(this.tools.map((tool) => ({
+			name: tool.mcpName,
+			description: tool.description,
+			inputSchema: tool.inputSchema,
+			_meta: { [ALWAYS_LOAD]: true },
+		}))));
 	}
 
-	private descriptor(): AcpMcpServer {
-		if (!this.url) throw new AntigravityAcpError("spawn", "MCP bridge is not listening");
-		return {
-			type: "http",
-			name: "pi-bridge",
-			url: this.url,
-			headers: [{ name: "Authorization", value: `Bearer ${this.token}` }],
-		};
+	/** Whether `mcpName` is a tool this bridge currently projects. */
+	has(mcpName: string): boolean {
+		return this.tools.some((tool) => tool.mcpName === mcpName);
 	}
 
-	private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-		if (request.url !== "/mcp" || request.method !== "POST") {
-			response.writeHead(405).end();
-			return;
-		}
-		if (!validBearerToken(request.headers.authorization, this.token)) {
-			response.writeHead(401).end();
-			return;
-		}
-		const body = await readJson(request);
-		const protocol = new Server(
-			{ name: "pi-antigravity-acp-tools", version: PACKAGE_VERSION },
-			{ capabilities: { tools: {} } },
-		);
-		protocol.setRequestHandler(ListToolsRequestSchema, () => ({
-			tools: this.tools.map((tool) => ({
-				name: tool.mcpName,
-				description: tool.description,
-				inputSchema: tool.inputSchema as { type: "object"; properties?: Record<string, object> },
-			})),
-		}));
-		protocol.setRequestHandler(CallToolRequestSchema, async (call, extra) => {
-			const tool = this.tools.find((candidate) => candidate.mcpName === call.params.name);
-			if (!tool) return toolError("Unknown or inactive Pi tool");
-			const args = call.params.arguments ?? {};
-			try {
-				if (!Value.Check(tool.originalSchema, args)) {
-					return toolError("Arguments failed the original Pi tool schema");
-				}
-			} catch {
-				return toolError("The original Pi tool schema could not validate these arguments");
-			}
-			const progressToken = extra._meta?.progressToken;
-			let keepalive: ReturnType<typeof setInterval> | undefined;
-			const stopKeepalive = () => {
-				if (!keepalive) return;
-				clearInterval(keepalive);
-				keepalive = undefined;
-			};
-			if (typeof progressToken === "string" || typeof progressToken === "number") {
-				// Count wait intervals, not a percentage of tool completion. MCP requires
-				// strictly increasing progress even when the total is unknown.
-				let progress = 0;
-				const sendProgress = () => {
-					if (extra.signal.aborted) {
-						stopKeepalive();
-						return;
-					}
-					void extra.sendNotification({
-						method: "notifications/progress",
-						params: {
-							progressToken,
-							progress: progress++,
-							message: "Waiting for Pi tool execution",
-						},
-					}).catch(() => undefined);
-				};
-				sendProgress();
-				const intervalMs = Math.max(10, this.options.progressKeepaliveMs ?? DEFAULT_PROGRESS_KEEPALIVE_MS);
-				keepalive = setInterval(sendProgress, intervalMs);
-				keepalive.unref?.();
-				extra.signal.addEventListener("abort", stopKeepalive, { once: true });
-			}
-			try {
-				return await this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args });
-			} finally {
-				extra.signal.removeEventListener("abort", stopKeepalive);
-				stopKeepalive();
-			}
-		});
-		const transport = new StreamableHTTPServerTransport(
-			{ sessionIdGenerator: undefined } as unknown as ConstructorParameters<
-				typeof StreamableHTTPServerTransport
-			>[0],
-		);
+	async call(mcpName: string, args: Record<string, unknown>): Promise<CallToolResult> {
+		const tool = this.tools.find((candidate) => candidate.mcpName === mcpName);
+		if (!tool) return toolError("Unknown or inactive Pi tool");
 		try {
-			await protocol.connect(transport as Parameters<typeof protocol.connect>[0]);
-			await transport.handleRequest(request, response, body);
-		} finally {
-			await transport.close();
-			await protocol.close();
+			if (!Value.Check(tool.originalSchema, args)) {
+				return toolError("Arguments failed the original Pi tool schema");
+			}
+		} catch {
+			return toolError("The original Pi tool schema could not validate these arguments");
+		}
+		return this.options.onCall({ id: crypto.randomUUID(), name: tool.piName, arguments: args });
+	}
+}
+
+function toolError(text: string): CallToolResult {
+	return { content: [{ type: "text", text }], isError: true };
+}
+
+const agyTokens = (value: unknown): number => Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / 3);
+
+const listingTokens = (tools: readonly BridgeToolListing[]): number =>
+	tools.reduce((total, tool) => total + agyTokens(tool), 0);
+
+/** Descriptions shorter than this say nothing ("The fil…") and only spend the
+ * budget on the key, so such a cut drops the text entirely. */
+function cutDescription(text: string, maxBytes: number): string | undefined {
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+	const characters = [...text];
+	let bytes = 0;
+	let end = 0;
+	for (const character of characters) {
+		const size = Buffer.byteLength(character, "utf8");
+		if (bytes + size > Math.max(0, maxBytes - 3)) break;
+		bytes += size;
+		end++;
+	}
+	const cut = characters.slice(0, end).join("").replace(/[\s,;:.-]+$/u, "");
+	return Buffer.byteLength(cut, "utf8") >= MIN_DESCRIPTION_BYTES ? `${cut}…` : undefined;
+}
+
+function capDescriptions(value: unknown, maxBytes: number): unknown {
+	if (Array.isArray(value)) return value.map((item) => capDescriptions(item, maxBytes));
+	if (!value || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "description" && typeof child === "string") {
+			const cut = cutDescription(child, maxBytes);
+			if (cut === undefined) continue;
+			output[key] = cut;
+			continue;
+		}
+		output[key] = capDescriptions(child, maxBytes);
+	}
+	return output;
+}
+
+/** Pure: shrink only description prose until the listing fits the budget. A set
+ * too large even with no descriptions at all goes with its schemas intact and
+ * is left to agy's own trimming. */
+function fitToolsToBudget(tools: BridgeToolListing[], budget = TOOL_TOKEN_BUDGET): BridgeToolListing[] {
+	if (listingTokens(tools) <= budget) return tools;
+	let low = 0;
+	let high = budget;
+	let best = capDescriptions(tools, 0) as BridgeToolListing[];
+	if (listingTokens(best) > budget) return best;
+	while (low <= high) {
+		const mid = Math.floor((low + high) / 2);
+		const candidate = capDescriptions(tools, mid) as BridgeToolListing[];
+		if (listingTokens(candidate) <= budget) {
+			best = candidate;
+			low = mid + 1;
+		} else {
+			high = mid - 1;
 		}
 	}
+	return best;
 }
 
 function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): BridgeTool[] {
@@ -207,7 +188,7 @@ function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): Bridge
 	const names = new Set<string>();
 	for (const tool of tools) {
 		if (tool.name === PERMISSION_TOOL_NAME) continue;
-		const mcpName = `pi_${tool.name}`.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
+		const mcpName = projectedMcpName(tool.name);
 		if (!mcpName || names.has(mcpName)) {
 			omissions.push({ name: tool.name, reason: "duplicate or invalid projected name" });
 			continue;
@@ -217,37 +198,14 @@ function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): Bridge
 			omissions.push({ name: tool.name, reason: `schema omitted (${projected.reason})` });
 			continue;
 		}
-		const inputSchema = projected.schema;
 		names.add(mcpName);
 		output.push({
 			mcpName,
 			piName: tool.name,
 			description: tool.description,
-			inputSchema,
+			inputSchema: projected.schema,
 			originalSchema: tool.parameters,
 		});
 	}
 	return output;
-}
-
-async function readJson(request: IncomingMessage): Promise<unknown> {
-	const chunks: Buffer[] = [];
-	let size = 0;
-	for await (const chunk of request) {
-		const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
-		size += bytes.length;
-		if (size > BODY_LIMIT) throw new AntigravityAcpError("invalid_input", "MCP request body is too large");
-		chunks.push(bytes);
-	}
-	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-
-function validBearerToken(header: string | undefined, token: string): boolean {
-	const actual = Buffer.from(header ?? "");
-	const expected = Buffer.from(`Bearer ${token}`);
-	return actual.byteLength === expected.byteLength && timingSafeEqual(actual, expected);
-}
-
-function toolError(text: string): CallToolResult {
-	return { content: [{ type: "text", text }], isError: true };
 }

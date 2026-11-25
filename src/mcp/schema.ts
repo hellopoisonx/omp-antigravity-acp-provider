@@ -188,7 +188,8 @@ function sanitizeNode(value: object, depth: number, budget: ProjectionBudget): P
 			list = snapshot;
 		}
 		let valid: boolean;
-		if (STRING_KEYS.has(key)) valid = typeof candidate === "string";
+		if (key === "pattern") valid = typeof candidate === "string" && isRe2SafePattern(candidate);
+		else if (STRING_KEYS.has(key)) valid = typeof candidate === "string";
 		else if (NUMBER_KEYS.has(key)) valid = typeof candidate === "number" && Number.isFinite(candidate);
 		else if (key === "multipleOf") valid = typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0;
 		else if (COUNT_KEYS.has(key)) valid = Number.isSafeInteger(candidate) && (candidate as number) >= 0;
@@ -220,4 +221,58 @@ function sanitizeNode(value: object, depth: number, budget: ProjectionBudget): P
 function jsonScalar(value: unknown): value is null | string | number | boolean {
 	if (typeof value === "number") return Number.isFinite(value);
 	return value === null || typeof value === "string" || typeof value === "boolean";
+}
+
+// agy compiles projected `pattern` values with Go's RE2 engine; an ECMA-262-only
+// escape (`\uXXXX`), lookaround, or backreference makes agy fail building the entire
+// toolbox. Omit any tool whose pattern RE2 would reject or reinterpret.
+const RE2_SAFE_ESCAPES = new Set(["f", "n", "r", "t", "v", "d", "D", "s", "S", "w", "W"]);
+
+function isRe2SafePattern(source: string): boolean {
+	try {
+		new RegExp(source);
+	} catch {
+		return false;
+	}
+	let inClass = false;
+	let classStart = -1;
+	for (let index = 0; index < source.length; index++) {
+		const char = source[index];
+		if (char === "\\") {
+			if (index + 1 >= source.length) return false;
+			const next = source[++index]!;
+			if (next === "x") {
+				const rest = source.slice(index + 1);
+				if (rest.startsWith("{")) {
+					const match = /^\{([0-9a-fA-F]+)\}/u.exec(rest);
+					if (!match) return false;
+					const cp = Number.parseInt(match[1]!, 16);
+					if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+					index += match[0].length;
+				} else if (/^[0-9a-fA-F]{2}/u.test(rest)) {
+					index += 2;
+				} else {
+					return false;
+				}
+			} else if ((next === "b" || next === "B") && !inClass) {
+				continue;
+			} else if (/^[a-zA-Z]$/u.test(next)) {
+				if (!RE2_SAFE_ESCAPES.has(next)) return false;
+			} else if (/^[0-9]$/u.test(next)) {
+				return false;
+			}
+			continue;
+		}
+		if (inClass) {
+			if (char === "]" && index > classStart) inClass = false;
+			continue;
+		}
+		if (char === "[") {
+			inClass = true;
+			classStart = index + 1 + (source[index + 1] === "^" ? 1 : 0);
+		} else if (char === "(" && source[index + 1] === "?") {
+			if (source[index + 2] !== ":") return false;
+		}
+	}
+	return !inClass;
 }

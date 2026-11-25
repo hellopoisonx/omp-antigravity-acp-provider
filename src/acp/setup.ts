@@ -10,6 +10,7 @@ import { Open, type File as ZipFile } from "unzipper";
 import { loadConfig, type RuntimeUpdateMode } from "../config.js";
 import { resolveAntigravityAcpDirectory, resolveAntigravityAcpLaunch, type AntigravityLaunch } from "./antigravity.js";
 import { AntigravityAcpConnection } from "./connection.js";
+import { FORCE_FILE_STORAGE_ENV } from "./credential-storage.js";
 import { AntigravityAcpError } from "./errors.js";
 import {
 	compareRuntimeVersions,
@@ -430,20 +431,33 @@ export function isExpectedRuntimeIdentity(
 }
 
 async function validateRuntime(directory: string, release: ResolvedRuntimeRelease): Promise<void> {
-	const connection = new AntigravityAcpConnection({
-		cwd: directory,
-		command: path.join(directory, release.binaryName),
-		args: release.args,
-		initializeTimeoutMs: VALIDATION_TIMEOUT_MS,
-		operationTimeoutMs: VALIDATION_TIMEOUT_MS,
-	});
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-acp-validation-"));
+	const env: NodeJS.ProcessEnv = {
+		...process.env,
+		GEMINI_HOME: home,
+		[FORCE_FILE_STORAGE_ENV]: "1",
+	};
+	delete env.GEMINI_API_KEY;
+	let connection: AntigravityAcpConnection | undefined;
 	try {
+		connection = new AntigravityAcpConnection({
+			cwd: directory,
+			command: path.join(directory, release.binaryName),
+			args: release.args,
+			env,
+			initializeTimeoutMs: VALIDATION_TIMEOUT_MS,
+			operationTimeoutMs: VALIDATION_TIMEOUT_MS,
+		});
 		const initialized = await connection.initialize();
 		if (!isExpectedRuntimeIdentity(initialized, release.version)) {
 			throw new Error("Downloaded runtime did not identify as the expected Antigravity ACP release");
 		}
 	} finally {
-		await connection.close();
+		try {
+			await connection?.close();
+		} finally {
+			fs.rmSync(home, { recursive: true, force: true });
+		}
 	}
 }
 
@@ -630,7 +644,7 @@ async function withInstallLock<T>(root: string, operation: () => Promise<T>): Pr
 	fs.mkdirSync(root, { recursive: true, mode: 0o700 });
 	const lock = path.join(root, ".update-lock");
 	const deadline = Date.now() + INSTALL_TIMEOUT_MS;
-	for (;;) {
+	for (; ;) {
 		try {
 			fs.mkdirSync(lock, { mode: 0o700 });
 			fs.writeFileSync(path.join(lock, "owner.json"), JSON.stringify({ pid: process.pid, createdAt: Date.now() }), {
@@ -770,7 +784,7 @@ async function readBoundedText(response: Response, maxBytes: number): Promise<st
 	let text = "";
 	let bytes = 0;
 	try {
-		for (;;) {
+		for (; ;) {
 			const { value, done } = await reader.read();
 			if (done) break;
 			if (!value) continue;

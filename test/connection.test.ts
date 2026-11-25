@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
@@ -21,6 +23,31 @@ describe("AntigravityAcpConnection", () => {
 			});
 			expect(connection.process.ignoredStdoutNoiseLines).toBe(1);
 		} finally {
+			await connection.close();
+		}
+	});
+
+	it("opens a session with no `_meta` routing: the tool channel is argv, not metadata", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agy-modern-"));
+		const log = path.join(directory, "agent.log");
+		const connection = new AntigravityAcpConnection({
+			cwd: path.dirname(fakeAgent),
+			command: process.execPath,
+			args: [fakeAgent, "agy-modern"],
+			env: { ...process.env, FAKE_AGENT_LOG_FILE: log },
+		});
+		try {
+			// agy >= 1.5.3 stops advertising mcpCapabilities.http; the bridge no
+			// longer depends on it, because tools flow through --ide-mcp-port.
+			expect((await connection.initialize()).agentCapabilities?.mcpCapabilities?.http).toBeUndefined();
+			await connection.newSession(process.cwd());
+			const created = fs.readFileSync(log, "utf8").trim().split("\n")
+				.map((line) => JSON.parse(line) as { method: string; params?: { mcpServers?: unknown; _meta?: unknown } })
+				.find((entry) => entry.method === "session/new");
+			expect(created?.params?.mcpServers).toEqual([]);
+			expect(created?.params?._meta).toBeUndefined();
+		} finally {
+			fs.rmSync(directory, { recursive: true, force: true });
 			await connection.close();
 		}
 	});

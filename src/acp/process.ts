@@ -23,6 +23,16 @@ export interface AntigravityProcessOptions {
 	/** Overrides the credential-storage resolution seams (keychain probe and
 	 * token path) in tests; production callers leave this unset. */
 	credentialStorage?: Omit<CredentialStorageOptions, "env">;
+	/** Request process-level auto-approval (`--dangerously-skip-permissions`) when launching the `agy` CLI. */
+	autoApprove?: boolean;
+	/** Project workspace the Agy agent may act in (`--add-dir`). */
+	projectDir?: string;
+	/** Loopback tool channel agy dials through its own `nc` (`--ide-mcp-port`). */
+	ideMcpPort?: number;
+	/** Variables the private `nc` shim needs to reach that channel. */
+	controlEnv?: Record<string, string>;
+	/** Directory placed first on the child's PATH (the `nc` shim). */
+	pathPrepend?: string;
 }
 
 export interface ProcessExit {
@@ -121,6 +131,10 @@ export function applyDefaultTlsEnvironment(
 
 export class AntigravityProcess {
 	readonly generation = nextGeneration++;
+	readonly autoApprove: boolean;
+	/** True when the spawned command was given `--ide-mcp-port`, so the model can
+	 * only reach the bridged tools once agy has listed them. */
+	readonly ideChannel: boolean;
 	readonly child: ChildProcessWithoutNullStreams;
 	readonly input: ReadableStream<Uint8Array>;
 	readonly output: WritableStream<Uint8Array>;
@@ -138,23 +152,39 @@ export class AntigravityProcess {
 		if (options.command) {
 			command = options.command;
 			args = options.args ?? [];
+			this.autoApprove = args.includes("--dangerously-skip-permissions");
+			// A fixture reaches the tool channel through the control environment
+			// instead; only the real CLI launch takes `--ide-mcp-port`.
+			this.ideChannel = false;
 		} else {
 			const nodeBinary = resolveNodeBinary(options.env?.NODE, options.env ?? process.env);
 			const launch = options.entryPath
-				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])] }
-				: resolveAntigravityAcpLaunch();
+				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])], autoApprove: false }
+				: resolveAntigravityAcpLaunch({
+					autoApprove: options.autoApprove === true,
+					...(options.projectDir ? { projectDir: options.projectDir } : {}),
+					...(options.ideMcpPort === undefined ? {} : { ideMcpPort: options.ideMcpPort }),
+				});
 			command = nodeBinary;
 			args = [resolveSupervisorEntry(), "--command", launch.command, ...launch.args];
+			this.autoApprove = launch.autoApprove === true;
+			this.ideChannel = launch.args.includes("--ide-mcp-port");
 		}
 		let resolveExit!: (exit: ProcessExit) => void;
 		this.exited = new Promise((resolve) => {
 			resolveExit = resolve;
 		});
 
-		const env = applyCredentialStorageEnvironment(
+		const baseEnv = applyCredentialStorageEnvironment(
 			applyDefaultTlsEnvironment(applyAcpProxyEnvironment(options.env ?? process.env)),
 			options.credentialStorage ?? {},
 		);
+		// agy reaches --ide-mcp-port by running `nc` from PATH, so the shim has to
+		// be first there and carry the channel token through the child's env.
+		const env: NodeJS.ProcessEnv = { ...baseEnv, ...options.controlEnv };
+		if (options.pathPrepend) {
+			env.PATH = [options.pathPrepend, baseEnv.PATH ?? baseEnv.Path ?? ""].filter(Boolean).join(path.delimiter);
+		}
 		const child = spawn(command, args, {
 			cwd: path.resolve(options.cwd),
 			env,

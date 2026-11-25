@@ -32,9 +32,15 @@
     "docs",
     "runtime-manifest.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    ".omp-plugin"
   ],
   "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./extensions/index.ts"
     ]
@@ -69,6 +75,7 @@
     "@agentclientprotocol/sdk": "2.6.0",
     "@modelcontextprotocol/sdk": "1.32.2",
     "proper-lockfile": "4.1.2",
+    "typebox": "1.4.7",
     "unzipper": "0.12.5",
     "zod": "4.6.7"
   },
@@ -79,7 +86,6 @@
     "@types/proper-lockfile": "4.1.4",
     "@types/unzipper": "0.10.11",
     "esbuild": "0.28.2",
-    "typebox": "1.4.7",
     "typescript": "7.0.2",
     "vitest": "5.1.0"
   }

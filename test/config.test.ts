@@ -62,12 +62,13 @@ describe("permission configuration", () => {
 
 	it("resolves default agent directory and config paths when PI_CODING_AGENT_DIR is unset", () => {
 		delete process.env.PI_CODING_AGENT_DIR;
-		const defaultAgentDir = path.join(os.homedir(), ".pi", "agent");
+		const defaultAgentDir = path.join(os.homedir(), ".omp", "agent");
 		expect(resolvePiAgentDir()).toBe(defaultAgentDir);
-		expect(resolveConfigRoot()).toBe(path.join(defaultAgentDir, "antigravity-acp-provider"));
-		expect(resolveConfigPath()).toBe(path.join(defaultAgentDir, "antigravity-acp-provider", "config.json"));
-		expect(DEFAULT_CONFIG_PATH).toBe(path.join(defaultAgentDir, "antigravity-acp-provider", "config.json"));
-		expect(LEGACY_GEMINI_CONFIG_PATH).toBe(path.join(defaultAgentDir, "gemini-acp-provider", "config.json"));
+		expect(resolveConfigRoot()).toBe(path.join(defaultAgentDir, "pi-antigravity-acp"));
+		expect(resolveConfigPath()).toBe(path.join(defaultAgentDir, "pi-antigravity-acp", "config.json"));
+		// The Pi profile stays the read-only migration source for the OMP profile.
+		expect(DEFAULT_CONFIG_PATH).toBe(path.join(os.homedir(), ".pi", "agent", "antigravity-acp-provider", "config.json"));
+		expect(LEGACY_GEMINI_CONFIG_PATH).toBe(path.join(os.homedir(), ".pi", "agent", "gemini-acp-provider", "config.json"));
 	});
 
 	it("respects PI_CODING_AGENT_DIR environment variable", () => {
@@ -80,14 +81,14 @@ describe("permission configuration", () => {
 		process.env.PI_CODING_AGENT_DIR = customAgentDir;
 
 		expect(resolvePiAgentDir()).toBe(customAgentDir);
-		expect(resolveConfigRoot()).toBe(path.join(customAgentDir, "antigravity-acp-provider"));
-		expect(resolveConfigPath()).toBe(path.join(customAgentDir, "antigravity-acp-provider", "config.json"));
+		expect(resolveConfigRoot()).toBe(path.join(customAgentDir, "pi-antigravity-acp"));
+		expect(resolveConfigPath()).toBe(path.join(customAgentDir, "pi-antigravity-acp", "config.json"));
 
 		expect(loadConfig()).toEqual({ permissions: "yolo", runtimeUpdates: "automatic", toolActivity: "compact" });
 		savePermissionMode("default");
 		expect(loadConfig()).toEqual({ permissions: "default", runtimeUpdates: "automatic", toolActivity: "compact" });
 
-		const configFile = path.join(customAgentDir, "antigravity-acp-provider", "config.json");
+		const configFile = path.join(customAgentDir, "pi-antigravity-acp", "config.json");
 		expect(fs.existsSync(configFile)).toBe(true);
 	});
 
@@ -100,7 +101,7 @@ describe("permission configuration", () => {
 	});
 
 	it("falls back to default when PI_CODING_AGENT_DIR is empty or whitespace", () => {
-		const defaultAgentDir = path.join(os.homedir(), ".pi", "agent");
+		const defaultAgentDir = path.join(os.homedir(), ".omp", "agent");
 
 		process.env.PI_CODING_AGENT_DIR = "";
 		expect(resolvePiAgentDir()).toBe(defaultAgentDir);
@@ -123,7 +124,7 @@ describe("permission configuration", () => {
 		);
 
 		expect(loadConfig()).toEqual({ permissions: "auto_edit", runtimeUpdates: "manual", toolActivity: "compact" });
-		const targetFile = path.join(fakeHome, ".pi", "agent", "antigravity-acp-provider", "config.json");
+		const targetFile = path.join(fakeHome, ".omp", "agent", "pi-antigravity-acp", "config.json");
 		expect(fs.existsSync(targetFile)).toBe(true);
 	});
 
@@ -144,7 +145,7 @@ describe("permission configuration", () => {
 		process.env.PI_CODING_AGENT_DIR = customAgentDir;
 
 		expect(loadConfig()).toEqual({ permissions: "auto_edit", runtimeUpdates: "notify", toolActivity: "compact" });
-		const targetFile = path.join(customAgentDir, "antigravity-acp-provider", "config.json");
+		const targetFile = path.join(customAgentDir, "pi-antigravity-acp", "config.json");
 		expect(fs.existsSync(targetFile)).toBe(true);
 		expect(fs.readFileSync(path.join(defaultAntigravityDir, "config.json"), "utf8")).toBe(
 			JSON.stringify({ permissions: "auto_edit", runtimeUpdates: "notify" }),

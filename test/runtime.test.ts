@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
+import { prepareAgentWorkspace } from "../src/acp/agent.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import {
 	AntigravityRuntime,
@@ -45,6 +46,47 @@ describe("AntigravityRuntime", () => {
 			expect((await runtime.snapshot()).permissionMode).toBe("default");
 		} finally {
 			await runtime.close();
+		}
+	});
+
+	it("keeps sessions that only read models, quota or auth out of the user's workspace", async () => {
+		const agentDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-acp-utility-cwd-")));
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const calls: Array<{ connection: string; projectDir: string | undefined; session: string }> = [];
+		const runtime = new AntigravityRuntime((options) => {
+			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] });
+			const newSession = connection.newSession.bind(connection);
+			connection.newSession = (cwd, ...rest) => {
+				calls.push({ connection: options.cwd, projectDir: options.projectDir, session: cwd });
+				return newSession(cwd, ...rest);
+			};
+			return connection;
+		});
+		const utilityCwd = path.join(agentDir, "pi-antigravity-acp", "utility-cwd");
+		const utilityWorkspace = prepareAgentWorkspace(utilityCwd);
+		try {
+			await runtime.discoverModels("test-key");
+			await runtime.verifyApiKey("test-key");
+			await runtime.loginGoogle();
+			await runtime.quota("test-key");
+			expect(calls).toEqual(Array.from({ length: 4 }, () => ({
+				connection: utilityWorkspace,
+				projectDir: undefined,
+				session: utilityCwd,
+			})));
+			expect(fs.statSync(utilityCwd).isDirectory()).toBe(true);
+
+			calls.length = 0;
+			const turn = runtime.stream(model, { messages: [{ role: "user", content: "hello", timestamp: 1 }] }, { apiKey: "test-key", sessionId: "workspace-session" });
+			for await (const _event of turn.stream) void _event;
+			const chatWorkspace = prepareAgentWorkspace(process.cwd());
+			expect(calls).toEqual([{ connection: chatWorkspace, projectDir: process.cwd(), session: chatWorkspace }]);
+		} finally {
+			await runtime.close();
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
 	});
 

@@ -1,0 +1,12 @@
+{
+  "name": "pi-antigravity-acp",
+  "owner": { "name": "zacbemis" },
+  "plugins": [
+    {
+      "name": "pi-antigravity-acp-provider",
+      "description": "Minimal OMP-adapted Google Antigravity ACP provider",
+      "version": "0.1.22",
+      "source": "./"
+    }
+  ]
+}

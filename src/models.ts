@@ -7,6 +7,9 @@ import type {
 
 export const PROVIDER_ID = "antigravity-acp";
 export const API_ID = "antigravity-acp";
+/** OMP reserves `antigravity-acp` for its own built-in API, so its registered
+ * provider streams under this custom API id instead. */
+export const OMP_API_ID = "pi-antigravity-acp";
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 type Effort = "low" | "medium" | "high" | "xhigh";
@@ -198,6 +201,42 @@ export function modelForAcpStream(
 	const { thinkingLevelMap: _stale, ...base } = model;
 	return { ...base, reasoning: discovered.reasoning,
 		...(discovered.thinkingLevelMap && { thinkingLevelMap: discovered.thinkingLevelMap }) };
+}
+
+/** Model row in the shape OMP's `registerProvider(name, config)` accepts. OMP rebuilds each
+ * row through its catalog overlay, which keeps `thinking` but drops `thinkingLevelMap`. */
+export interface OmpProviderModelConfig {
+	id: string;
+	name: string;
+	api: typeof OMP_API_ID;
+	reasoning: boolean;
+	thinking?: { mode: "effort"; efforts: ModelEffort[] };
+	input: ("text" | "image")[];
+	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+	contextWindow: number;
+	maxTokens: number;
+}
+
+export function toOmpModelConfig(model: Model<typeof API_ID>): OmpProviderModelConfig {
+	const efforts = (["low", "medium", "high", "xhigh"] as const).filter(
+		(effort) => typeof model.thinkingLevelMap?.[effort] === "string" && Boolean(model.thinkingLevelMap[effort]),
+	);
+	return {
+		id: model.id,
+		name: model.name,
+		api: OMP_API_ID,
+		reasoning: model.reasoning,
+		...(model.reasoning && efforts.length > 0 ? { thinking: { mode: "effort" as const, efforts } } : {}),
+		input: [...model.input],
+		cost: {
+			input: model.cost.input,
+			output: model.cost.output,
+			cacheRead: model.cost.cacheRead,
+			cacheWrite: model.cost.cacheWrite,
+		},
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+	};
 }
 
 /** Resolve Pi's current reasoning level to the exact model ID advertised by

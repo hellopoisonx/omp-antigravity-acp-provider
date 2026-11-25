@@ -2,19 +2,36 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { AGENT_NAME } from "./agent.js";
 import { AntigravityAcpError } from "./errors.js";
 
 export interface AntigravityLaunch {
 	command: string;
 	args: string[];
 	source: "env" | "user-bin" | "managed" | "path";
+	/** True when the launch passes `--dangerously-skip-permissions` to `agy acp`. */
+	autoApprove?: boolean;
 }
 
-export function resolveAntigravityAcpLaunch(): AntigravityLaunch {
+export interface AntigravityLaunchOptions {
+	/** Pass `--dangerously-skip-permissions` to the CLI. */
+	autoApprove?: boolean;
+	/** Workspace the Agy agent may act in (`--add-dir`). */
+	projectDir?: string;
+	/** Loopback tool channel agy reaches through its own `nc` dial. */
+	ideMcpPort?: number;
+}
+
+export function resolveAntigravityAcpLaunch(options?: AntigravityLaunchOptions): AntigravityLaunch {
+	const autoApprove = options?.autoApprove === true;
 	const env = process.env.AGY_ACP_BIN?.trim();
 	if (env) {
 		const command = expandHome(env);
-		if (executable(command)) return directOrWrapper(command, "env");
+		if (executable(command)) {
+			return AGY_CLI_NAME.test(path.basename(command))
+				? agyCliLaunch(command, "env", options)
+				: directOrWrapper(command, "env");
+		}
 	}
 
 	// Prefer the provider's verified active release over ambient executables.
@@ -32,6 +49,9 @@ export function resolveAntigravityAcpLaunch(): AntigravityLaunch {
 		if (!directory) continue;
 		const candidate = path.join(directory, "agy_acp_server.par");
 		if (executable(candidate)) return directOrWrapper(candidate, "path");
+		// Reuse an installed agy CLI instead of downloading the managed archive.
+		const cli = path.join(directory, process.platform === "win32" ? "agy.exe" : "agy");
+		if (executable(cli)) return agyCliLaunch(cli, "path", options);
 	}
 
 	throw new AntigravityAcpError(
@@ -143,6 +163,35 @@ export function clearAntigravityCredentials(
 	} catch {
 		fs.rmSync(settingsPath, { force: true });
 	}
+}
+
+const AGY_CLI_NAME = /^agy(?:\.exe)?$/iu;
+
+/** The single-binary `agy` CLI serves the same ACP agent through a subcommand and
+ * keeps its credential store under the same app data dir as the archive build.
+ * It is also the only launch that can run a named Agy agent: `--agent` with an
+ * empty `tools:` definition is what keeps agy's own tools away from the model,
+ * and `--ide-mcp-port` is the one channel those tools are replaced through. */
+function agyCliLaunch(
+	command: string,
+	source: AntigravityLaunch["source"],
+	options?: AntigravityLaunchOptions,
+): AntigravityLaunch {
+	const autoApprove = options?.autoApprove === true;
+	return {
+		command,
+		args: [
+			"acp",
+			"--app_data_dir=antigravity-acp",
+			"--agent", AGENT_NAME,
+			"--include-default-customizations=false",
+			...(options?.projectDir ? ["--add-dir", options.projectDir] : []),
+			...(options?.ideMcpPort === undefined ? [] : ["--ide-mcp-port", String(options.ideMcpPort)]),
+			...(autoApprove ? ["--dangerously-skip-permissions"] : []),
+		],
+		source,
+		autoApprove,
+	};
 }
 
 function directOrWrapper(command: string, source: AntigravityLaunch["source"]): AntigravityLaunch {

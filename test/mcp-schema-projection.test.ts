@@ -1,6 +1,4 @@
 import type { Tool } from "@earendil-works/pi-ai";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 
@@ -74,6 +72,9 @@ describe("MCP schema projection", () => {
 		for (const value of [
 			{ enum: [] }, { enum: ["x", {}] }, { anyOf: [] }, { multipleOf: 0 }, { multipleOf: -1 },
 			{ minimum: undefined }, { minimum: Infinity }, { minItems: -1 }, { type: ["string", "invalid"] },
+			{ type: "string", pattern: "^[^\\uD800-\\uDFFF]*$" },
+			{ type: "string", pattern: "^(?=foo)" },
+			{ type: "string", pattern: "^(a)\\1$" },
 		]) omitted(property(value), "invalid_keyword_value");
 		omitted(JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"}}}'), "unsafe_property_name");
 		omitted({ properties: { value: { type: "string" } } }, "not_object");
@@ -157,23 +158,17 @@ describe("MCP schema projection", () => {
 		omitted(property({ enum: new Array(2 ** 32 - 1) }), "too_large");
 	});
 
-	it("advertises exact choices over MCP and retains original call-time validation", async () => {
+	it("advertises exact choices and retains original call-time validation", async () => {
 		const onCall = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ok" }] }));
 		const bridge = new PiMcpBridge({ tools: [route], onCall });
-		const descriptor = await bridge.start();
-		if (!descriptor || !("url" in descriptor)) throw new Error("bridge missing");
-		const client = new Client({ name: "schema-test", version: "1" }, { capabilities: {} });
-		const transport = new StreamableHTTPClientTransport(new URL(descriptor.url), {
-			requestInit: { headers: Object.fromEntries(descriptor.headers.map(({ name, value }) => [name, value])) },
+		const listing = bridge.listing();
+		expect(listing[0]?.inputSchema).toMatchObject({
+			properties: { provider: { anyOf: [{ const: "antigravity-acp" }, { const: "other" }] } },
 		});
-		try {
-			await client.connect(transport as Parameters<typeof client.connect>[0]);
-			const catalog = await client.listTools();
-			expect(catalog.tools[0]?.inputSchema.properties?.provider).toMatchObject({ anyOf: [{ const: "antigravity-acp" }, { const: "other" }] });
-			expect((await client.callTool({ name: "pi_route", arguments: { provider: "invalid" } })).isError).toBe(true);
-			expect(onCall).not.toHaveBeenCalled();
-			expect((await client.callTool({ name: "pi_route", arguments: { provider: "antigravity-acp" } })).isError).toBeFalsy();
-			expect(onCall).toHaveBeenCalledOnce();
-		} finally { await client.close(); await bridge.close(); }
+		expect(listing[0]?._meta).toEqual({ "antigravity/alwaysLoad": true });
+		expect((await bridge.call("pi_route", { provider: "invalid" })).isError).toBe(true);
+		expect(onCall).not.toHaveBeenCalled();
+		expect((await bridge.call("pi_route", { provider: "antigravity-acp" })).isError).toBeFalsy();
+		expect(onCall).toHaveBeenCalledOnce();
 	});
 });

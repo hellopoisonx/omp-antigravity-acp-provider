@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { STATE_DIR_NAME } from "./constants.js";
+
 export type PermissionMode = "default" | "auto_edit" | "yolo";
 export type RuntimeUpdateMode = "automatic" | "notify" | "manual";
 export type ToolActivityMode = "off" | "compact" | "full";
@@ -19,11 +21,19 @@ export function resolvePiAgentDir(): string {
 			? path.join(os.homedir(), custom.slice(1))
 			: custom;
 	}
-	return path.join(os.homedir(), ".pi", "agent");
+	return path.join(os.homedir(), ".omp", "agent");
 }
 
 export function resolveConfigRoot(): string {
-	return path.join(resolvePiAgentDir(), "antigravity-acp-provider");
+	return path.join(resolvePiAgentDir(), STATE_DIR_NAME);
+}
+
+// agy writes files (skills/system/…) into the cwd of a session. Sessions that only read
+// models, quota or auth use this folder, so they do not write into the user's workspace.
+export function resolveUtilityCwd(): string {
+	const dir = path.join(resolveConfigRoot(), "utility-cwd");
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	return dir;
 }
 
 export function resolveConfigPath(): string {

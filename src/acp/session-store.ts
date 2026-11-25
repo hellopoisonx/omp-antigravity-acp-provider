@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { resolvePiAgentDir } from "../config.js";
+import { resolveConfigRoot } from "../config.js";
 import { withStoreLock } from "./store-lock.js";
 
 export interface SavedSessionRecord {
@@ -15,7 +15,7 @@ export interface SavedSessionRecord {
 }
 
 export function resolveSessionStorePath(): string {
-	return path.join(resolvePiAgentDir(), "antigravity-acp-provider", "sessions.json");
+	return path.join(resolveConfigRoot(), "sessions.json");
 }
 
 const MAX_RECORDS = 256;

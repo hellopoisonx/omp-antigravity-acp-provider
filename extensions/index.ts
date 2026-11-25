@@ -29,8 +29,11 @@ import {
 	ACP_SDK_VERSION,
 	PACKAGE_VERSION,
 	QUOTA_REQUEST_CHANNEL,
+	SLASH_COMMAND_NAME,
 } from "../src/constants.js";
 import type { AntigravityQuotaSnapshot } from "../src/acp/usage-quota.js";
+import { PROVIDER_ID } from "../src/models.js";
+import type { SharedRuntime } from "../src/shared-runtime.js";
 import {
 	PERMISSION_RESULT_KIND,
 	PERMISSION_TOOL_NAME,
@@ -48,14 +51,28 @@ const CLAIMED_QUOTA_REQUESTS = Symbol.for("pi-antigravity-acp:quota-requests");
 const claimSlots = globalThis as unknown as Record<symbol, WeakSet<object> | undefined>;
 const claimedQuotaRequests = (claimSlots[CLAIMED_QUOTA_REQUESTS] ??= new WeakSet());
 
+/** OMP adds host members that Pi's `ExtensionAPI` type does not declare. */
+interface OmpHostApi {
+	unregisterProvider?: (name: string) => void;
+}
+
+/** OMP's host takes `registerProvider(name, config)`; Pi's takes the provider object. */
+function registerWithHost(host: ExtensionAPI & OmpHostApi, shared: SharedRuntime): void {
+	const registerFn = host.registerProvider as unknown as (...args: unknown[]) => void;
+	if (registerFn.length >= 2) registerFn(PROVIDER_ID, shared.toOmpProviderConfig());
+	else host.registerProvider(shared.provider);
+}
+
 export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 	registerAntigravityAcp(pi);
 }
 
 export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: AntigravityConnectionFactory): void {
+	const host = pi as ExtensionAPI & OmpHostApi;
 	const shared = acquireSharedRuntime(connectionFactory);
-	const { runtime, provider } = shared;
-	pi.registerProvider(provider);
+	const { runtime } = shared;
+	const syncProviderRegistration = () => registerWithHost(host, shared);
+	syncProviderRegistration();
 
 	// Other extensions ask for quota with `{ reply }` and get exactly one `{ ok, quota | error }`.
 	const unsubscribeQuota = pi.events.on(QUOTA_REQUEST_CHANNEL, (data) => {
@@ -74,11 +91,16 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 		});
 	});
 
+	// OMP-only attributes, outside Pi's ToolDefinition: the runtime synthesizes `{ requestId }` calls
+	// itself, so the tool must stay top-level and skip OMP's otherwise required `i` intent argument.
+	const ompToolAttributes = { loadMode: "essential", intent: "omit" } as const;
+
 	pi.registerTool({
 		name: PERMISSION_TOOL_NAME,
 		label: "Antigravity ACP Permission",
 		description: "Presents an Antigravity ACP permission request to the user. Only call IDs emitted by the provider are valid.",
 		parameters: Type.Object({ requestId: Type.String({ minLength: 1, maxLength: 128 }) }),
+		...ompToolAttributes,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const request = runtime.getPermission(params.requestId);
@@ -138,7 +160,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 				}
 				if (!isRuntimeUpdateMode(requested)) {
 					ctx.ui.notify(
-						"Usage: /antigravity-acp updates [automatic|notify|manual]",
+						`Usage: /${SLASH_COMMAND_NAME} updates [automatic|notify|manual]`,
 						"warning",
 					);
 					return;
@@ -149,8 +171,13 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 			}
 			if (command === "logout" || command === "account" || command === "switch-account") {
 				await runtime.logout();
+				// OMP keeps the registered fallback API key until the provider is re-registered.
+				if (host.unregisterProvider) {
+					host.unregisterProvider(PROVIDER_ID);
+					syncProviderRegistration();
+				}
 				ctx.ui.notify(
-					"Local Antigravity credentials and saved ACP sessions were cleared. Run /logout for the old Pi marker, then /login to choose the next account.",
+					`Local Antigravity credentials and saved ACP sessions were cleared. Run /logout for the old Pi marker, then /login to choose the next account.`,
 					"info",
 				);
 				return;
@@ -181,7 +208,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 				}
 				if (!isPermissionMode(requested)) {
 					ctx.ui.notify(
-						"Usage: /antigravity-acp permissions [default|auto-edit|yolo]",
+						`Usage: /${SLASH_COMMAND_NAME} permissions [default|auto-edit|yolo]`,
 						"warning",
 					);
 					return;
@@ -211,7 +238,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 				}
 				if (!isToolActivityMode(requested)) {
 					ctx.ui.notify(
-						"Usage: /antigravity-acp tool-activity [off|compact|full]",
+						`Usage: /${SLASH_COMMAND_NAME} tool-activity [off|compact|full]`,
 						"warning",
 					);
 					return;
@@ -224,7 +251,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 			const verbose = command === "doctor --verbose";
 			if (command !== "doctor" && command !== "status" && !verbose) {
 				ctx.ui.notify(
-					"Usage: /antigravity-acp [setup|doctor|status|quota|update|updates|logout|account|qualify|permissions|tool-activity]",
+					`Usage: /${SLASH_COMMAND_NAME} [setup|doctor|status|quota|update|updates|logout|account|qualify|permissions|tool-activity]`,
 					"warning",
 				);
 				return;
@@ -260,11 +287,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 			);
 		},
 	};
-	pi.registerCommand("antigravity-acp", commandDefinition);
-	pi.registerCommand("gemini-acp", {
-		...commandDefinition,
-		description: "Deprecated alias for /antigravity-acp",
-	});
+	pi.registerCommand(SLASH_COMMAND_NAME, commandDefinition);
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (loadConfig().runtimeUpdates !== "notify") return;
@@ -278,7 +301,7 @@ export function registerAntigravityAcp(pi: ExtensionAPI, connectionFactory?: Ant
 			} else if (update.updateAvailable) {
 				ctx.ui.notify(
 					update.managed
-						? `Antigravity ACP ${update.approvedVersion} is available. Run /antigravity-acp update.`
+						? `Antigravity ACP ${update.approvedVersion} is available. Run /${SLASH_COMMAND_NAME} update.`
 						: `Antigravity ACP ${update.approvedVersion} is available, but the selected external runtime must be updated manually.`,
 					"info",
 				);

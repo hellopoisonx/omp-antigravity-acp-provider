@@ -10,12 +10,52 @@ import type {
 } from "@earendil-works/pi-ai";
 
 import { hasAntigravityAuth } from "./acp/antigravity.js";
-import { FALLBACK_MODELS, modelForAcpStream, projectModels, PROVIDER_ID, restoreModels } from "./models.js";
+import {
+	API_ID,
+	FALLBACK_MODELS,
+	modelForAcpStream,
+	OMP_API_ID,
+	projectModels,
+	PROVIDER_ID,
+	restoreModels,
+	toOmpModelConfig,
+	type OmpProviderModelConfig,
+} from "./models.js";
 import { AntigravityRuntime, MANAGED_AUTH_MARKER } from "./runtime.js";
 
 export interface AntigravityProviderBundle {
 	provider: Provider<"antigravity-acp">;
 	runtime: AntigravityRuntime;
+	toOmpProviderConfig: () => OmpProviderConfig;
+}
+
+/** Callbacks OMP passes an extension-registered provider's `oauth.login`. */
+export interface OmpLoginCallbacks {
+	signal?: AbortSignal;
+	onAuth: (info: { url: string; instructions?: string }) => void;
+	onProgress?: (message: string) => void;
+	onManualCodeInput?: (signal?: AbortSignal) => Promise<string>;
+	onPrompt: (prompt: { message: string; placeholder?: string }) => Promise<string>;
+}
+
+/** The two-argument form OMP's `pi.registerProvider(name, config)` takes. */
+export interface OmpProviderConfig {
+	baseUrl: string;
+	api: typeof OMP_API_ID;
+	apiKey?: string | undefined;
+	models: OmpProviderModelConfig[];
+	fetchDynamicModels: (apiKey: string | undefined) => Promise<readonly OmpProviderModelConfig[]>;
+	streamSimple: (
+		model: Model<typeof OMP_API_ID>,
+		context: TranscriptContext,
+		options?: SimpleStreamOptions,
+	) => AssistantMessageEventStream;
+	oauth: {
+		name: string;
+		login: (callbacks: OmpLoginCallbacks) => Promise<{ refresh: string; access: string; expires: number }>;
+		refreshToken: <T>(credentials: T) => Promise<T>;
+		getApiKey: () => string;
+	};
 }
 
 export function createAntigravityProvider(runtime = new AntigravityRuntime()): AntigravityProviderBundle {
@@ -146,7 +186,49 @@ export function createAntigravityProvider(runtime = new AntigravityRuntime()): A
 			return stream(runtime, modelForAcpStream(model, models), context, options);
 		},
 	};
-	return { provider, runtime };
+	const toOmpProviderConfig = (): OmpProviderConfig => ({
+		// OMP requires a non-empty baseUrl for every provider that declares models; ACP
+		// spawns a local process instead of calling an endpoint.
+		baseUrl: "acp://antigravity",
+		api: OMP_API_ID,
+		// agy keeps its own login state where this provider cannot read it, so the marker
+		// is the fallback key: requests reach agy, which reports its own auth failures.
+		apiKey: process.env.GEMINI_API_KEY?.trim() || MANAGED_AUTH_MARKER,
+		models: models.map(toOmpModelConfig),
+		async fetchDynamicModels(apiKey) {
+			const key = apiKey || process.env.GEMINI_API_KEY?.trim() || MANAGED_AUTH_MARKER;
+			try {
+				const discovered = projectModels(await runtime.discoverModels(key));
+				if (discovered.length > 0) models = discovered;
+			} catch {
+				// Keep the offline catalog when the runtime is unreachable or unauthenticated.
+			}
+			return models.map(toOmpModelConfig);
+		},
+		streamSimple(model, context, options) {
+			return stream(runtime, modelForAcpStream({ ...model, api: API_ID }, models), context, options);
+		},
+		oauth: {
+			name: "Google Antigravity (ACP)",
+			async login(callbacks) {
+				callbacks.onProgress?.("Starting Antigravity Google login…");
+				await runtime.loginGoogle(callbacks.signal, callbacks.onProgress, {
+					showAuthorizationUrl: (url, instructions) => callbacks.onAuth({ url, instructions }),
+					promptForCallback: (signal) => callbacks.onManualCodeInput
+						? callbacks.onManualCodeInput(signal)
+						: callbacks.onPrompt({
+							message: "Paste the final localhost callback URL (or authorization code):",
+							placeholder: "http://127.0.0.1:PORT/?state=…&code=…",
+						}),
+				});
+				// OMP needs a durable credential record; the real OAuth tokens stay with Google Antigravity.
+				return { refresh: MANAGED_AUTH_MARKER, access: MANAGED_AUTH_MARKER, expires: Number.MAX_SAFE_INTEGER };
+			},
+			refreshToken: async (credentials) => credentials,
+			getApiKey: () => MANAGED_AUTH_MARKER,
+		},
+	});
+	return { provider, runtime, toOmpProviderConfig };
 }
 
 function stream(

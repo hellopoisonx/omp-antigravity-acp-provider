@@ -98,6 +98,32 @@ describe("permission policy and lifecycle", () => {
 		expect((await runtime.snapshot()).processes[0]?.confirmedPermissionMode).toBe("default");
 	});
 
+	it("maps agy >= 1.5.3 permission modes (accept-edits, autoApprove yolo) and refuses unbacked yolo", async () => {
+		const cliBacked = new AntigravityRuntime((options) => new AntigravityAcpConnection({
+			...options,
+			command: process.execPath,
+			args: [fakeAgent, "agy-modern", ...(options.autoApprove ? ["--dangerously-skip-permissions"] : [])],
+		}), "yolo");
+		runtimes.push(cliBacked);
+		expect((await turn(cliBacked, [user("hello")])).stopReason).toBe("stop");
+		expect((await cliBacked.snapshot()).processes[0]?.confirmedPermissionMode).toBe("yolo");
+		// Leaving yolo must drop the --dangerously-skip-permissions process instead of reusing it.
+		await cliBacked.setPermissionMode("auto_edit");
+		expect((await cliBacked.snapshot()).bindings).toBe(0);
+		expect((await turn(cliBacked, [user("edit")], "safety-edit")).stopReason).toBe("stop");
+		expect((await cliBacked.snapshot()).processes[0]?.confirmedPermissionMode).toBe("auto_edit");
+
+		const unbacked = new AntigravityRuntime((options) => new AntigravityAcpConnection({
+			...options,
+			command: process.execPath,
+			args: [fakeAgent, "agy-modern"],
+		}), "yolo");
+		runtimes.push(unbacked);
+		const refused = await turn(unbacked, [user("hello")], "unbacked");
+		expect(refused.stopReason).toBe("error");
+		expect(refused.errorMessage).toContain("did not advertise permission mode 'yolo'");
+	});
+
 	it("closes discovery still initializing and rejects late session creation", async () => {
 		const { runtime, connections, entries } = setup("initialize-timeout");
 		const discovery = runtime.discoverModels(undefined).catch((error: unknown) => error);
@@ -718,11 +744,16 @@ describe("context handoff transport", () => {
 });
 
 describe("tool projection diagnostics", () => {
-	it.each([undefined, "no-mcp"])("reports omitted tools and their reasons (agent=%s)", async (scenario) => {
-		const { runtime } = setup(scenario);
+	it("reports omitted tools and their reasons", async () => {
+		// Tools are always projected now: agy runs the `tools: []` Agy agent and
+		// receives OMP tools over `--ide-mcp-port`, independent of what the
+		// initialize response advertises.
+		const { runtime } = setup("no-mcp");
 		const writer = runtime.stream(model, { tools: [{ name: "unsupported", description: "bad", parameters: Type.String() }], messages: [user("hello")] }, { sessionId: "omissions", apiKey: "test-key" });
 		await drain(writer);
-		expect((await runtime.snapshot()).processes[0]?.omittedTools).toEqual([{ name: "unsupported", reason: expect.stringContaining(scenario ? "MCP over HTTP" : "not_object") }]);
+		expect((await runtime.snapshot()).processes[0]?.omittedTools).toEqual([
+			{ name: "unsupported", reason: expect.stringContaining("not_object") },
+		]);
 	});
 
 	it("revalidates changed tools before a continuation early return", async () => {

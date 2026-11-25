@@ -40,6 +40,52 @@ describe("native Pi provider", () => {
 		}
 	});
 
+	it("keeps an array system prompt and developer notices that OMP passes outside pi-ai's transcript types", async () => {
+		const prompts: Array<Parameters<AntigravityAcpConnection["prompt"]>[0]> = [];
+		const runtime = new AntigravityRuntime((options) => {
+			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] });
+			const prompt = connection.prompt.bind(connection);
+			connection.prompt = (request, signal) => {
+				prompts.push(request);
+				return prompt(request, signal);
+			};
+			return connection;
+		});
+		try {
+			const { provider } = createAntigravityProvider(runtime);
+			const cyclicTool: Record<string, unknown> = {
+				name: "echo",
+				description: "Echo text",
+				parameters: Type.Object({ text: Type.String() }),
+			};
+			cyclicTool.runner = cyclicTool;
+			const context = {
+				systemPrompt: ["Rule 1", "Rule 2"],
+				tools: [cyclicTool],
+				messages: [
+					{ role: "developer", content: "earlier notice", timestamp: 1 },
+					{ role: "user", content: "hello", timestamp: 2 },
+					{ role: "developer", content: "trailing notice", timestamp: 3 },
+				],
+			};
+			const result = await provider
+				.streamSimple(model, context as unknown as Parameters<typeof provider.streamSimple>[1], { apiKey: "test-key" })
+				.result();
+			expect(result.stopReason).toBe("stop");
+			const sent = prompts[0]!.prompt
+				.map((block) => block.type === "text" ? block.text
+					: block.type === "resource" && "text" in block.resource ? block.resource.text
+					: "")
+				.join("\n");
+			expect(sent).toContain("Rule 1\n\nRule 2");
+			expect(sent).toContain("## Developer");
+			expect(sent).toContain("trailing notice");
+			expect(sent).not.toContain("Tool result (undefined");
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("routes tools added by a transcript delta through the MCP bridge", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),

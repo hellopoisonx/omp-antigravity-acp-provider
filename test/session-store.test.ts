@@ -50,7 +50,7 @@ describe("AcpSessionStore", () => {
 	it("uses default session store path when PI_CODING_AGENT_DIR is unset", () => {
 		delete process.env.PI_CODING_AGENT_DIR;
 		expect(resolveSessionStorePath()).toBe(
-			path.join(os.homedir(), ".pi", "agent", "antigravity-acp-provider", "sessions.json"),
+			path.join(os.homedir(), ".omp", "agent", "pi-antigravity-acp", "sessions.json"),
 		);
 	});
 
@@ -75,7 +75,7 @@ describe("AcpSessionStore", () => {
 		roots.push(customAgentDir);
 		process.env.PI_CODING_AGENT_DIR = customAgentDir;
 
-		const expectedFile = path.join(customAgentDir, "antigravity-acp-provider", "sessions.json");
+		const expectedFile = path.join(customAgentDir, "pi-antigravity-acp", "sessions.json");
 		expect(resolveSessionStorePath()).toBe(expectedFile);
 
 		const store = new AcpSessionStore();

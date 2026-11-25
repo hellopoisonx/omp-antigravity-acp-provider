@@ -24,6 +24,7 @@ import {
 	removeConversation,
 	type AntigravityAuthHealth,
 } from "./acp/antigravity.js";
+import { prepareAgentWorkspace } from "./acp/agent.js";
 import { AntigravityAcpConnection, type AntigravityConnectionOptions } from "./acp/connection.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
 import { quotaExhaustion } from "./acp/quota.js";
@@ -48,14 +49,19 @@ import {
 	type ToolOmission,
 	type PiToolInvocation,
 } from "./mcp/bridge.js";
-import type { PermissionMode, ToolActivityMode } from "./config.js";
+import { McpControlServer, bridgedToolName, newControlToken } from "./mcp/control.js";
+import { ensureNcShim } from "./mcp/shim.js";
+import { resolveUtilityCwd, type PermissionMode, type ToolActivityMode } from "./config.js";
 import { resolveAcpModelId } from "./models.js";
-import { type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { type PromptParts, buildPromptParts, currentSystemInstructions, developerMessage } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { usageFromPrompt } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
 
 const PERMISSION_TIMEOUT_MS = 120_000;
+/** agy reads the bridged catalog when the session opens; a prompt sent before it
+ * does would run with the model seeing none of OMP's tools. */
+const TOOL_LIST_WAIT_MS = 20_000;
 const TOOL_BATCH_MS = 100;
 const QUOTA_CACHE_MS = 60_000;
 const QUOTA_TIMEOUT_MS = 30_000;
@@ -82,6 +88,7 @@ interface Binding {
 	initialize: InitializeResponse;
 	session: AcpNewSessionResponse;
 	mode: PermissionMode;
+	wireMode: string;
 	instructionsFingerprint: string | undefined;
 	needsReconstruction: boolean;
 	modelId: string;
@@ -98,6 +105,7 @@ interface Binding {
 	inferences: number;
 	toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
 	bridge: PiMcpBridge | undefined;
+	control: McpControlServer | undefined;
 	toolFingerprint: string;
 	omittedTools: ToolOmission[];
 	turnCompletion: Promise<void> | undefined;
@@ -205,7 +213,28 @@ export class AntigravityRuntime {
 		// ACP has no mid-conversation system-message API. Replay Pi's prompt/tool
 		// deltas into a checkpoint; its fingerprint invalidates stale warm sessions.
 		try {
-			const transcript = collapseSystemMessages(normalizeContext(context));
+			// OMP hands the system prompt over as `string[]` and passes live `AgentTool`
+			// wrappers carrying cyclic runner/session references; normalize both at entry
+			// before pi-ai's transcript helpers and `canonicalJson` touch them.
+			const rawPrompt: unknown = context.systemPrompt;
+			const hasSystemToolDeltas = context.messages.some(
+				(message) => message.role === "system" && Array.isArray(message.toolsAdded) && message.toolsAdded.length > 0,
+			);
+			const normalizedInput: Context = {
+				...context,
+				...(Array.isArray(rawPrompt) ? { systemPrompt: rawPrompt.filter(Boolean).join("\n\n") } : {}),
+				...(context.tools ? { tools: stripToolDeclarations(context.tools) } : {}),
+				...(hasSystemToolDeltas
+					? {
+						messages: context.messages.map((message) =>
+							message.role === "system" && Array.isArray(message.toolsAdded)
+								? { ...message, toolsAdded: stripToolDeclarations(message.toolsAdded) }
+								: message,
+						),
+					}
+					: {}),
+			};
+			const transcript = collapseSystemMessages(normalizeContext(normalizedInput));
 			const resolvedContext: Context = {
 				messages: transcript.messages,
 				systemPrompt: getCurrentSystemPrompt(transcript.messages),
@@ -237,8 +266,8 @@ export class AntigravityRuntime {
 		if (this.ensureAgent) await ensureAntigravityAcpReady();
 		if (signal?.aborted) throw abortError();
 		this.assertEpoch(epoch);
-		const cwd = process.cwd();
-		const connection = this.createConnection({ cwd });
+		const cwd = resolveUtilityCwd();
+		const connection = this.createConnection({ cwd: prepareAgentWorkspace(cwd) });
 		try {
 			const initialize = await connection.initialize(signal);
 			this.assertEpoch(epoch);
@@ -288,9 +317,9 @@ export class AntigravityRuntime {
 		this.assertEpoch(epoch);
 		let sessionId: string | undefined;
 		let text = "";
-		const cwd = process.cwd();
+		const cwd = resolveUtilityCwd();
 		const connection = this.createConnection({
-			cwd,
+			cwd: prepareAgentWorkspace(cwd),
 			promptIdleTimeoutMs: QUOTA_TIMEOUT_MS,
 			handlers: {
 				onUpdate: ({ sessionId: id, update }) => {
@@ -327,9 +356,9 @@ export class AntigravityRuntime {
 		this.assertEpoch(epoch);
 		const useManualOAuth = manualInteraction !== undefined && shouldUseHeadlessOAuth();
 		const relay = useManualOAuth ? new HeadlessOAuthRelay() : undefined;
-		const cwd = process.cwd();
+		const cwd = resolveUtilityCwd();
 		const connection = this.createConnection({
-			cwd,
+			cwd: prepareAgentWorkspace(cwd),
 			...(relay ? { env: relay.env } : {}),
 		});
 		try {
@@ -392,8 +421,8 @@ export class AntigravityRuntime {
 		const epoch = this.bindingEpoch;
 		if (this.ensureAgent) await ensureAntigravityAcpReady(onProgress);
 		this.assertEpoch(epoch);
-		const cwd = process.cwd();
-		const connection = this.createConnection({ cwd });
+		const cwd = resolveUtilityCwd();
+		const connection = this.createConnection({ cwd: prepareAgentWorkspace(cwd) });
 		try {
 			const initialize = await connection.initialize();
 			this.assertEpoch(epoch);
@@ -428,12 +457,22 @@ export class AntigravityRuntime {
 			this.assertActive();
 			this.permissionMode = mode;
 			await Promise.all([...this.resolvedBindings].map(async (binding) => {
-				if (binding.mode === mode && this.confirmedMode(binding) === mode) return;
+				const state = binding.connection.getSessionState(binding.session.sessionId);
+				const nextWireMode = resolveWireMode(state, mode, binding.connection.process.autoApprove);
+				// Never reuse a `--dangerously-skip-permissions` process for a stricter mode, or vice versa.
+				const autoApproveCompatible = mode === "yolo"
+					? (nextWireMode === "yolo" || binding.connection.process.autoApprove)
+					: !binding.connection.process.autoApprove;
+				if (binding.mode === mode && this.confirmedMode(binding) === binding.wireMode && autoApproveCompatible) return;
 				// Never change policy under an executing turn or leave an unsupported session alive.
-				if (!binding.turnCompletion && supportsMode(binding.connection.getSessionState(binding.session.sessionId), mode)) {
+				if (!binding.turnCompletion && nextWireMode && autoApproveCompatible) {
 					try {
-						await binding.connection.setMode(binding.session.sessionId, mode);
-						if (this.confirmedMode(binding) === mode) { binding.mode = mode; return; }
+						await binding.connection.setMode(binding.session.sessionId, nextWireMode);
+						if (this.confirmedMode(binding) === nextWireMode) {
+							binding.mode = mode;
+							binding.wireMode = nextWireMode;
+							return;
+						}
 					} catch { /* Close below; the next turn must negotiate again. */ }
 				}
 				await this.invalidateBinding(binding);
@@ -472,7 +511,9 @@ export class AntigravityRuntime {
 					waitingForPermission: binding.permission !== undefined,
 					waitingForTools: binding.pendingTools.size,
 					agentVersion: binding.initialize.agentInfo?.version,
-					mcpHttp: binding.initialize.agentCapabilities?.mcpCapabilities?.http === true,
+					// The bridged tool channel is the `--ide-mcp-port` backhaul agy dials
+					// through the private `nc` shim; sessions declare `tools: []`.
+					mcpHttp: binding.bridge !== undefined,
 					restored: binding.restored,
 					ignoredStdoutNoiseLines: binding.connection.process.ignoredStdoutNoiseLines,
 					...(includeStderr ? { stderrTail: binding.connection.process.stderrTail } : {}),
@@ -531,7 +572,7 @@ export class AntigravityRuntime {
 				const value = await binding;
 				await Promise.allSettled([
 					value.connection.close(),
-					value.bridge?.close() ?? Promise.resolve(),
+					value.control?.close() ?? Promise.resolve(),
 				]);
 			}),
 		);
@@ -562,7 +603,7 @@ export class AntigravityRuntime {
 			await this.modeChanges;
 			this.assertSessionEpoch(key, epoch, sessionEpoch);
 			// Check before continuation early returns as well as before fresh prompts.
-			if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode ||
+			if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== binding.wireMode ||
 				binding.toolFingerprint !== piToolFingerprint(tools)) {
 				await this.invalidateBinding(binding);
 				this.assertSessionEpoch(key, epoch, sessionEpoch);
@@ -645,11 +686,11 @@ export class AntigravityRuntime {
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 				if (
 					binding.needsReconstruction || binding.mode !== this.permissionMode ||
-					this.confirmedMode(binding) !== this.permissionMode ||
+					this.confirmedMode(binding) !== binding.wireMode ||
 					binding.toolFingerprint !== piToolFingerprint(tools) ||
 					context.messages.length < binding.messageCount ||
 					messagesFingerprint(context.messages.slice(0, binding.messageCount)) !==
-						binding.historyFingerprint
+					binding.historyFingerprint
 				) {
 					await this.dropBinding(key, binding, true);
 					this.assertSessionEpoch(key, epoch, sessionEpoch);
@@ -679,12 +720,12 @@ export class AntigravityRuntime {
 					unseenStart += 1;
 				}
 				const parts = adaptPromptToCapabilities(
-					buildPromptParts(context, fresh, unseenStart),
+					buildPromptParts(context, fresh, unseenStart, Boolean(binding.bridge && !binding.bridge.empty)),
 					binding.initialize,
 				);
 				await this.modeChanges;
 				this.assertSessionEpoch(key, epoch, sessionEpoch);
-				if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== this.permissionMode) {
+				if (binding.mode !== this.permissionMode || this.confirmedMode(binding) !== binding.wireMode) {
 					await this.invalidateBinding(binding);
 					throw new AntigravityAcpError("protocol", "Permission mode changed before prompting; retry the turn");
 				}
@@ -837,7 +878,7 @@ export class AntigravityRuntime {
 		tools: Context["tools"],
 		signal?: AbortSignal,
 	): Promise<Binding> {
-		for (;;) {
+		for (; ;) {
 			this.assertActive();
 			const existing = this.bindings.get(key);
 			if (!existing) break;
@@ -871,13 +912,35 @@ export class AntigravityRuntime {
 		entryPromise: Promise<Binding>,
 		signal?: AbortSignal,
 	): Promise<Binding> {
-		const cwd = process.cwd();
+		const projectDir = process.cwd();
+		// agy runs inside the private Agy-agent workspace whose definition declares
+		// `tools: []`; that is what keeps agy's own file, shell and browser tools
+		// out of the model's function list. OMP tools arrive over the ide channel.
+		const cwd = prepareAgentWorkspace(projectDir);
 		let binding: Binding | undefined;
 		let bridge: PiMcpBridge | undefined;
+		let control: McpControlServer | undefined;
+		let ideChannel: { port: number; env: Record<string, string> } | undefined;
 		const epoch = this.bindingEpoch;
 		const sessionEpoch = this.sessionEpoch(key);
+		const requestedMode = this.permissionMode;
+		if (tools.length > 0) {
+			bridge = new PiMcpBridge({
+				tools,
+				onCall: (invocation) => this.requestPiTool(binding, invocation),
+			});
+			if (!bridge.empty) {
+				control = new McpControlServer(newControlToken(), bridge);
+				const handshake = await control.start();
+				ideChannel = { port: handshake.port, env: handshake.env };
+			}
+		}
 		const connection = this.createConnection({
 			cwd,
+			projectDir,
+			autoApprove: requestedMode === "yolo",
+			...(ideChannel === undefined ? {} : { ideMcpPort: ideChannel.port, controlEnv: ideChannel.env }),
+			...(ideChannel === undefined ? {} : { pathPrepend: ensureNcShim() }),
 			handlers: {
 				onUpdate: (notification) => this.consumeUpdate(binding, notification),
 				onPermission: (request) => this.requestPermission(binding, request),
@@ -888,18 +951,8 @@ export class AntigravityRuntime {
 			this.assertSessionEpoch(key, epoch, sessionEpoch);
 			await authenticateForCredential(connection, initialize, apiKey, signal);
 			this.assertSessionEpoch(key, epoch, sessionEpoch);
-			const omittedTools = initialize.agentCapabilities?.mcpCapabilities?.http === true
-				? planToolProjection(tools)
-				: tools.filter((tool) => tool.name !== PERMISSION_TOOL_NAME).map((tool) => ({ name: tool.name, reason: "Agent did not advertise MCP over HTTP" }));
-			let mcpServer;
-			if (tools.length > 0 && initialize.agentCapabilities?.mcpCapabilities?.http === true) {
-				bridge = new PiMcpBridge({
-					tools,
-					onCall: (invocation) => this.requestPiTool(binding, invocation),
-				});
-				mcpServer = await bridge.start();
-			}
-			const mcpServers = mcpServer ? [mcpServer] : [];
+			const omittedTools = planToolProjection(tools);
+			const mcpServers: [] = [];
 			const piSessionId = key.startsWith("sid:") ? key.slice(4) : undefined;
 			const saved = piSessionId ? this.sessionStore?.get(piSessionId) : undefined;
 			let session: AcpNewSessionResponse | undefined;
@@ -926,13 +979,23 @@ export class AntigravityRuntime {
 			}
 			session ??= await connection.newSession(cwd, signal, mcpServers);
 			this.assertSessionEpoch(key, epoch, sessionEpoch);
+			// Fail closed: never prompt a session whose model cannot see the tools
+			// OMP declared, which would silently turn every tool call into prose.
+			if (control && connection.process.ideChannel && !await control.waitForListing(TOOL_LIST_WAIT_MS)) {
+				throw new AntigravityAcpError(
+					"protocol",
+					`Antigravity did not list the ${bridge?.projectedToolNames.length ?? 0} OMP tools for this session; refusing to prompt`,
+				);
+			}
 			const mode = this.permissionMode;
-			if (!supportsMode(session, mode)) {
+			if (mode !== requestedMode) throw new AntigravityAcpError("protocol", "Permission mode changed during session setup; retry the turn");
+			const wireMode = resolveWireMode(session, mode, connection.process.autoApprove);
+			if (!wireMode) {
 				if (piSessionId) this.sessionStore?.remove(piSessionId);
 				throw new AntigravityAcpError("protocol", `Antigravity ${restored ? "restored" : "new"} session did not advertise permission mode '${mode}'; refusing to prompt`);
 			}
-			if (sessionModes(session)?.currentModeId !== mode) await connection.setMode(session.sessionId, mode, signal);
-			if (sessionModes(connection.getSessionState(session.sessionId))?.currentModeId !== mode) {
+			if (sessionModes(session)?.currentModeId !== wireMode) await connection.setMode(session.sessionId, wireMode, signal);
+			if (sessionModes(connection.getSessionState(session.sessionId))?.currentModeId !== wireMode) {
 				throw new AntigravityAcpError("protocol", "Antigravity did not confirm the requested permission mode");
 			}
 			const currentModel = sessionModels(session)?.currentModelId;
@@ -946,6 +1009,7 @@ export class AntigravityRuntime {
 				initialize,
 				session,
 				mode,
+				wireMode,
 				instructionsFingerprint: undefined,
 				needsReconstruction: false,
 				modelId: acpModelId,
@@ -961,6 +1025,7 @@ export class AntigravityRuntime {
 				inferences: 0,
 				toolBatchTimer: undefined,
 				bridge,
+				control,
 				toolFingerprint: piToolFingerprint(tools),
 				omittedTools,
 				turnCompletion: undefined,
@@ -980,12 +1045,12 @@ export class AntigravityRuntime {
 				cancelPiTools(createdBinding, "Antigravity process exited before Pi returned the tool result");
 				this.resolvedBindings.delete(createdBinding);
 				this.syncIdleCleanupTimer();
-				void bridge?.close().catch(() => undefined);
+				void control?.close().catch(() => undefined);
 				if (this.bindings.get(key) === entryPromise) this.bindings.delete(key);
 			}).catch(() => undefined);
 			return createdBinding;
 		} catch (error) {
-			await Promise.allSettled([connection.close(), bridge?.close() ?? Promise.resolve()]);
+			await Promise.allSettled([connection.close(), control?.close() ?? Promise.resolve()]);
 			throw error;
 		}
 	}
@@ -1054,6 +1119,14 @@ export class AntigravityRuntime {
 		binding: Binding | undefined,
 		request: RequestPermissionRequest,
 	): Promise<RequestPermissionResponse> {
+		// Newer agy asks before an ide-tools call too. That call executes in OMP
+		// under OMP's own approval, so it is allowed once here; a request that
+		// would run inside agy itself is not bridged and goes to OMP's broker.
+		const bridged = bridgedToolName(request.toolCall);
+		if (bridged && binding?.bridge?.has(bridged)) {
+			const allow = request.options.find((option) => option.kind === "allow_once");
+			if (allow) return Promise.resolve({ outcome: { outcome: "selected", optionId: allow.optionId } });
+		}
 		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested || request.sessionId !== binding.session.sessionId) {
 			return Promise.resolve({ outcome: { outcome: "cancelled" } });
 		}
@@ -1083,7 +1156,7 @@ export class AntigravityRuntime {
 	private consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {
 		if (!binding || notification.sessionId !== binding.session.sessionId) return;
 		if ((notification.update.sessionUpdate === "config_option_update" || notification.update.sessionUpdate === "current_mode_update") &&
-			this.confirmedMode(binding) !== this.permissionMode) {
+			this.confirmedMode(binding) !== binding.wireMode) {
 			binding.writer?.fail(new AntigravityAcpError("protocol", "Antigravity changed the permission mode unexpectedly; session closed"), false);
 			void this.invalidateBinding(binding).catch(() => undefined);
 			return;
@@ -1118,7 +1191,7 @@ export class AntigravityRuntime {
 		}
 		cancelPermission(binding);
 		cancelPiTools(binding, "Antigravity session closed before Pi returned the tool result");
-		await Promise.allSettled([binding.connection.close(), binding.bridge?.close() ?? Promise.resolve()]);
+		await Promise.allSettled([binding.connection.close(), binding.control?.close() ?? Promise.resolve()]);
 	}
 
 	private touchBinding(binding: Binding): void {
@@ -1284,8 +1357,17 @@ function hasUsableLocalAuth(health: AntigravityAuthHealth): boolean {
 	return health.status === "api-key-env" || health.status === "oauth-refreshable";
 }
 
-function supportsMode(session: SessionState, mode: PermissionMode): boolean {
-	return sessionModes(session)?.availableModes.some((candidate) => candidate.id === mode) === true;
+/** Maps Pi's permission modes to what the server actually advertises. Old ACP builds
+ * expose `auto_edit`/`yolo`; agy >= 1.5.3 exposes `accept-edits` and enforces `yolo`
+ * via `--dangerously-skip-permissions` over the `default` session mode. */
+function resolveWireMode(session: SessionState, mode: PermissionMode, autoApprove: boolean): string | undefined {
+	const available = sessionModes(session)?.availableModes;
+	if (!available) return undefined;
+	const has = (id: string) => available.some((candidate) => candidate.id === id);
+	if (has(mode)) return mode;
+	if (mode === "auto_edit" && has("accept-edits")) return "accept-edits";
+	if (mode === "yolo" && autoApprove && has("default")) return "default";
+	return undefined;
 }
 
 function permissionView(permission: PendingPermission): PermissionView {
@@ -1342,9 +1424,24 @@ function messagesFingerprint(messages: Context["messages"]): string {
 	return createHash("sha256").update(fingerprints.join("\n")).digest("hex");
 }
 
+/** Keeps only the serializable tool declaration fields so cyclic OMP AgentTool
+ * wrappers cannot blow up transcript hashing or schema projection. */
+function stripToolDeclarations(tools: NonNullable<Context["tools"]>): NonNullable<Context["tools"]> {
+	return tools.map((tool) => ({
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+	}));
+}
+
 function messageFingerprint(message: Context["messages"][number]): string {
+	// OMP-only role outside pi-ai's Message union; without this branch its content
+	// hashes as a tool result with undefined call identity.
+	const developer = developerMessage(message);
 	let value: unknown;
-	if (message.role === "user") {
+	if (developer) {
+		value = { role: "developer", content: developer.content };
+	} else if (message.role === "user") {
 		value = { role: message.role, content: message.content };
 	} else if (message.role === "assistant") {
 		value = {

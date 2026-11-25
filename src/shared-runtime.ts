@@ -2,12 +2,13 @@ import type { Provider } from "@earendil-works/pi-ai";
 
 import { loadConfig } from "./config.js";
 import { PACKAGE_VERSION } from "./constants.js";
-import { createAntigravityProvider } from "./provider.js";
+import { createAntigravityProvider, type AntigravityProviderBundle } from "./provider.js";
 import { AntigravityRuntime, type AntigravityConnectionFactory } from "./runtime.js";
 
 export interface SharedRuntime {
 	runtime: AntigravityRuntime;
 	provider: Provider<"antigravity-acp">;
+	toOmpProviderConfig: AntigravityProviderBundle["toOmpProviderConfig"];
 	refs: number;
 	version: string;
 }
@@ -25,7 +26,14 @@ export function acquireSharedRuntime(connectionFactory?: AntigravityConnectionFa
 		const runtime = new AntigravityRuntime(connectionFactory, config.permissions, undefined, {
 			toolActivityMode: config.toolActivity,
 		});
-		shared = { runtime, provider: createAntigravityProvider(runtime).provider, refs: 0, version: PACKAGE_VERSION };
+		const bundle = createAntigravityProvider(runtime);
+		shared = {
+			runtime,
+			provider: bundle.provider,
+			toOmpProviderConfig: bundle.toOmpProviderConfig,
+			refs: 0,
+			version: PACKAGE_VERSION,
+		};
 		slots[KEY] = shared;
 	}
 	shared.refs += 1;

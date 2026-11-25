@@ -3,7 +3,8 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
-import { PiMcpBridge } from "../src/mcp/bridge.js";
+import { FALLBACK_MODELS } from "../src/models.js";
+import { AntigravityRuntime } from "../src/runtime.js";
 
 const enabled = process.env.PI_ANTIGRAVITY_ACP_QUALIFY === "1";
 
@@ -81,43 +82,64 @@ describe.skipIf(!enabled)("live Antigravity ACP qualification", () => {
 		}
 	}, 180_000);
 
-	it("registers and executes the authenticated loopback Pi MCP tool", async () => {
-		let value: string | undefined;
-		const bridge = new PiMcpBridge({
-			tools: [
+	it("bridges a Pi tool through the ide channel", async () => {
+		let value = "";
+		const runtime = new AntigravityRuntime();
+		const model = {
+			...FALLBACK_MODELS.find((entry) => entry.id === "gemini-3.8-flash")!,
+			contextWindow: 1_000_000,
+			maxTokens: 8_192,
+		};
+		const tools = [
+			{
+				name: "qualification_echo",
+				label: "Qualification Echo",
+				description: "Required qualification tool. Echoes a value through Pi.",
+				parameters: Type.Object({ value: Type.String() }),
+			} as unknown as Tool,
+		];
+		const sessionId = `qualify-bridge-${Date.now()}`;
+		const first = {
+			tools,
+			messages: [
 				{
-					name: "qualification_echo",
-					label: "Qualification Echo",
-					description: "Required qualification tool. Echoes a value through Pi.",
-					parameters: Type.Object({ value: Type.String() }),
-				} as unknown as Tool,
+					role: "user" as const,
+					content: "You must call the qualification_echo tool once with value MCP_LIVE_OK, then report its result.",
+					timestamp: Date.now(),
+				},
 			],
-			onCall: async (invocation) => {
-				value = String(invocation.arguments.value ?? "");
-				return { content: [{ type: "text", text: `echo:${value}` }] };
-			},
-		});
-		const server = await bridge.start();
-		expect(server).toBeDefined();
-		const acp = connection();
+		};
 		try {
-			await acp.initialize();
-			const session = await acp.newSession(process.cwd(), undefined, [server!]);
-			await acp.setMode(session.sessionId, "yolo");
-			await acp.setModel(session.sessionId, "gemini-3.8-flash-low");
-			const response = await acp.prompt({
-				sessionId: session.sessionId,
-				prompt: [
-					{
-						type: "text",
-						text: "You must call the pi-bridge MCP tool named pi_qualification_echo once with value MCP_LIVE_OK, then report its result.",
-					},
-				],
-			});
-			expect(response.stopReason).toBe("end_turn");
+			const firstWriter = runtime.stream(model, first, { sessionId, reasoning: "low" });
+			for await (const event of firstWriter.stream) void event;
+			const call = firstWriter.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("the model made no bridged tool call");
+			expect(call.name).toBe("qualification_echo");
+			value = String(call.arguments.value ?? "");
+			const secondWriter = runtime.stream(
+				model,
+				{
+					tools,
+					messages: [
+						...first.messages,
+						firstWriter.message,
+						{
+							role: "toolResult",
+							toolCallId: call.id,
+							toolName: call.name,
+							content: [{ type: "text", text: `echo:${value}` }],
+							isError: false,
+							timestamp: Date.now() + 1,
+						},
+					],
+				},
+				{ sessionId, reasoning: "low" },
+			);
+			for await (const event of secondWriter.stream) void event;
+			expect(secondWriter.message.stopReason).toBe("stop");
 			expect(value).toBe("MCP_LIVE_OK");
 		} finally {
-			await Promise.all([acp.close(), bridge.close()]);
+			await runtime.close();
 		}
 	}, 180_000);
 

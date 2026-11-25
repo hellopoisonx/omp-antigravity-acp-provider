@@ -5,10 +5,13 @@ import http from "node:http";
 import path from "node:path";
 import readline from "node:readline";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const scenario = process.argv[2];
+// The provider replaces agy's own tools with `--ide-mcp-port` and reaches that
+// channel through its private `nc` shim on PATH, exactly like the real CLI.
+const idePort = Number(process.env.PI_ANTIGRAVITY_CONTROL_PORT) || undefined;
 const modern = scenario?.startsWith("config-options") || scenario === "effort-selector" || scenario === "legacy-set-model";
 // The real 1.4.x server takes only base model ids on its `model` selector and
 // silently ignores an effort-qualified id; these scenarios model that.
@@ -21,7 +24,8 @@ let effort = "high";
 let permissionPromptId;
 let hangingPromptId;
 let bridgePromptId;
-let mcpServer;
+let bridgeTarget;
+let bridgeClient;
 // Set while the resource-exhausted scenario waits for the client to answer its permission request.
 let resumeAfterPermission;
 // Set while a bridge call and a permission request from the same inference are both outstanding.
@@ -47,7 +51,7 @@ for await (const line of rl) {
 	}
 	const { id, method, params } = message;
 	if (process.env.FAKE_AGENT_LOG_FILE && method) fs.appendFileSync(process.env.FAKE_AGENT_LOG_FILE,
-		JSON.stringify({ method, ...(method === "initialize" ? { params } : {}), ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
+		JSON.stringify({ method, ...(method === "initialize" || method === "session/new" ? { params } : {}), ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
 	if (id === "mixed-permission" && method === undefined) {
 		resolveMixedPermission?.(message.result?.outcome?.optionId ?? message.result?.outcome?.outcome ?? "cancelled");
 		resolveMixedPermission = undefined;
@@ -76,12 +80,16 @@ for await (const line of rl) {
 		if (scenario === "browser-noise") {
 			process.stdout.write("Opening in existing browser session.\n");
 		}
+		// agy >= 1.5.3: real self-identification, no advertised HTTP MCP capability.
+		const modernAgent = scenario === "agy-modern";
 		send({
 			jsonrpc: "2.0",
 			id,
 			result: {
 				protocolVersion: 1,
-				agentInfo: { name: "fake-gemini", version: "1.0.0" },
+				agentInfo: modernAgent
+					? { name: "Antigravity ACP Server", version: "1.5.13" }
+					: { name: "fake-gemini", version: "1.0.0" },
 				authMethods: [
 					{ id: "oauth-personal", name: "Log in with Google" },
 					{ id: "api", name: "Gemini API key", _meta: { "api-key": { provider: "google" } } },
@@ -89,8 +97,9 @@ for await (const line of rl) {
 				agentCapabilities: {
 					loadSession: true,
 					promptCapabilities: { image: true, embeddedContext: true },
-					mcpCapabilities: { http: scenario !== "no-mcp" },
+					...(modernAgent ? {} : { mcpCapabilities: { http: scenario !== "no-mcp" } }),
 					sessionCapabilities: { resume: {} },
+					...(modernAgent ? { _meta: { antigravity: { tier: true } } } : {}),
 				},
 			},
 		});
@@ -159,7 +168,12 @@ for await (const line of rl) {
 				fs.writeFileSync(skillFile, "# generated run-workflow\n");
 			}
 		}
-		mcpServer = params.mcpServers?.find((server) => server.type === "http");
+		// Real agy preloads the ide-tools server when the session opens: it dials
+		// `nc <host> <port>` and asks for the catalog before the first prompt.
+		if (Number.isInteger(idePort)) {
+			bridgeTarget = { port: idePort };
+			await openBridge(bridgeTarget);
+		}
 		send({
 			jsonrpc: "2.0",
 			id,
@@ -268,7 +282,8 @@ for await (const line of rl) {
 		const notify = (update) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update } });
 		// agy reports the context size after each inference; setup sends used: 0.
 		const usageUpdate = (used) => notify({ sessionUpdate: "usage_update", used, size: 1048576 });
-		if (text === "emit tool activity") {
+		// The prompt may prefix trusted instructions as text blocks; only the request tail matters.
+		if (text.endsWith("emit tool activity")) {
 			notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Reasoning" } });
 			notify({
 				sessionUpdate: "plan",
@@ -290,11 +305,11 @@ for await (const line of rl) {
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
-		if (!continuing && text.includes("bridge and permission") && mcpServer) {
+		if (!continuing && text.includes("bridge and permission") && bridgeTarget) {
 			// Like agy in default mode: one inference starts a pi-bridge call, then asks to run a
 			// native action before that call returns. Both answers are needed to finish the prompt.
 			const decision = new Promise((resolve) => { resolveMixedPermission = resolve; });
-			const bridge = invokeMcpTool(mcpServer, "from gemini", () => {
+			const bridge = invokeMcpTool(bridgeTarget, "from gemini", () => {
 				setTimeout(() => send({ jsonrpc: "2.0", id: "mixed-permission", method: "session/request_permission", params: {
 					sessionId: params.sessionId,
 					toolCall: { toolCallId: "native-tool-2", title: "Run native command", kind: "execute" },
@@ -310,7 +325,7 @@ for await (const line of rl) {
 			}).catch(() => undefined);
 			continue;
 		}
-		if (!continuing && text.includes("bridge") && mcpServer) {
+		if (!continuing && text.includes("bridge") && bridgeTarget) {
 			bridgePromptId = id;
 			finishBeforePiResult(id);
 			const reportUsage = text.includes("usage");
@@ -318,13 +333,13 @@ for await (const line of rl) {
 			const invocation = text.includes("parallel")
 				? Promise.all([
 						text.includes("reversed")
-							? new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(mcpServer, "first"))
-							: invokeMcpTool(mcpServer, "first"),
+							? new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "first"))
+							: invokeMcpTool(bridgeTarget, "first"),
 						text.includes("reversed")
-							? invokeMcpTool(mcpServer, "second")
-							: new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(mcpServer, "second")),
+							? invokeMcpTool(bridgeTarget, "second")
+							: new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "second")),
 					]).then((results) => results.join(","))
-				: invokeMcpTool(mcpServer, "from gemini", () => {
+				: invokeMcpTool(bridgeTarget, "from gemini", () => {
 					if (scenario !== "early-tool-turn-end") return;
 					setTimeout(() => {
 						if (bridgePromptId !== id) return;
@@ -529,6 +544,9 @@ function finishBeforePiResult(id) {
 
 function sessionModes(restored = false) {
 	if (scenario === "no-mode-metadata") return undefined;
+	if (scenario === "agy-modern") {
+		return { currentModeId: mode, availableModes: ["default", "accept-edits", "auto", "plan"].map((id) => ({ id, name: id })) };
+	}
 	const unavailable = scenario === "no-auto-edit-mode" ? "auto_edit"
 		: scenario === "no-default-mode" || (restored && scenario === "no-default-on-restore") ? "default" : undefined;
 	return { currentModeId: mode, availableModes: ["default", "auto_edit", "yolo"].filter((id) => id !== unavailable).map((id) => ({ id, name: id })) };
@@ -549,12 +567,24 @@ function sessionConfigOptions() {
 	];
 }
 
-async function invokeMcpTool(server, text, onConnected) {
-	const headers = Object.fromEntries(server.headers.map((header) => [header.name, header.value]));
+async function openBridge(target) {
+	const shim = path.join((process.env.PATH ?? "").split(path.delimiter)[0], process.platform === "win32" ? "nc.cmd" : "nc");
 	const client = new Client({ name: "fake-gemini", version: "1" }, { capabilities: {} });
-	const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers } });
+	const transport = new StdioClientTransport({
+		command: shim,
+		args: ["127.0.0.1", String(target.port)],
+		env: Object.fromEntries(Object.entries(process.env).filter(([, value]) => typeof value === "string")),
+	});
+	await client.connect(transport);
+	// agy lists the catalog itself once the server is connected.
+	await client.listTools();
+	return client;
+}
+
+async function invokeMcpTool(target, text, onConnected) {
+	bridgeClient ??= await openBridge(target);
+	const client = bridgeClient;
 	try {
-		await client.connect(transport);
 		onConnected?.();
 		const result = await client.callTool({ name: "pi_echo", arguments: { text } });
 		return result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");

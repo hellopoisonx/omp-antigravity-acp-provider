@@ -8,7 +8,8 @@ import { AntigravityAcpConnection } from "../src/acp/connection.js";
 import { AntigravityAcpError } from "../src/acp/errors.js";
 import { parseUsageQuota } from "../src/acp/usage-quota.js";
 import { QUOTA_REQUEST_CHANNEL } from "../src/constants.js";
-import { PERMISSION_TOOL_NAME } from "../src/runtime.js";
+import type { OmpProviderConfig } from "../src/provider.js";
+import { MANAGED_AUTH_MARKER, PERMISSION_TOOL_NAME } from "../src/runtime.js";
 import {
 	createFakeContext,
 	createFakeExtensionApi,
@@ -84,7 +85,40 @@ describe("extension entry point", () => {
 		const { pi } = await load("parent");
 		expect(registry.get("antigravity-acp")).toBe(pi.providers[0]);
 		expect(pi.tools.has(PERMISSION_TOOL_NAME)).toBe(true);
-		expect([...pi.commands.keys()]).toEqual(["antigravity-acp", "gemini-acp"]);
+		expect([...pi.commands.keys()]).toEqual(["pi-antigravity-acp"]);
+	});
+
+	it("registers OMP's two-argument provider config with effort thinking and a managed key", async () => {
+		vi.resetModules();
+		// A fresh module graph is the point: the extension caches state per load.
+		const { registerAntigravityAcp } = await import("../extensions/index.js");
+		const pi = createFakeExtensionApi(registry);
+		const registered: Array<{ name: string; config: OmpProviderConfig }> = [];
+		Object.assign(pi.api, {
+			// OMP's host method takes (name, config); its arity selects the OMP path.
+			registerProvider: (name: string, config: OmpProviderConfig) => {
+				registered.push({ name, config });
+			},
+		});
+		registerAntigravityAcp(pi.api, (options) => {
+			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
+				args: [fakeAgent], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
+			connections.push(connection);
+			return connection;
+		});
+		const ctx = createFakeContext({ sessionId: "omp", cwd: root });
+		loaded.push({ pi, ctx });
+
+		const [registration] = registered;
+		expect(registration?.name).toBe("antigravity-acp");
+		expect(registration?.config.baseUrl).toBe("acp://antigravity");
+		// OMP reserves "antigravity-acp" for its built-in API, so the registered one differs.
+		expect(registration?.config.api).toBe("pi-antigravity-acp");
+		expect(registration?.config.models.some(
+			(entry) => entry.thinking?.mode === "effort" && entry.thinking.efforts.includes("low"),
+		)).toBe(true);
+		expect(registration?.config.oauth.getApiKey()).toBe(MANAGED_AUTH_MARKER);
+		expect(pi.tools.get(PERMISSION_TOOL_NAME)).toMatchObject({ loadMode: "essential", intent: "omit" });
 	});
 
 	it("keeps the parent session usable after a child instance shuts down", async () => {
@@ -145,7 +179,7 @@ describe("extension entry point", () => {
 	it("reports process token totals without counting reasoning twice", async () => {
 		const { pi, ctx } = await load("parent");
 		await stream([user("usage single")], "parent");
-		await pi.commands.get("antigravity-acp")!.handler("quota", ctx as never);
+		await pi.commands.get("pi-antigravity-acp")!.handler("quota", ctx as never);
 		// Thought tokens are already part of output, so tokens= is input + output + cacheRead + cacheWrite.
 		expect(ctx.ui.notify.mock.calls.at(-1)![0]).toContain(
 			"Usage this process: turns=1 tokens=1200 input=600 output=200 reasoning=50 cacheRead=400",
@@ -155,7 +189,7 @@ describe("extension entry point", () => {
 	it("configures tool-activity via command arguments, interactive selector, and doctor output", async () => {
 		const { pi, ctx } = await load("parent");
 		const { loadConfig } = await import("../src/config.js");
-		const command = pi.commands.get("antigravity-acp")!;
+		const command = pi.commands.get("pi-antigravity-acp")!;
 
 		expect(loadConfig().toolActivity).toBe("compact");
 
@@ -182,7 +216,7 @@ describe("extension entry point", () => {
 
 		await command.handler("tool-activity invalid", ctx as never);
 		expect(ctx.ui.notify.mock.calls.at(-1)).toEqual([
-			"Usage: /antigravity-acp tool-activity [off|compact|full]",
+			"Usage: /pi-antigravity-acp tool-activity [off|compact|full]",
 			"warning",
 		]);
 
@@ -193,7 +227,7 @@ describe("extension entry point", () => {
 	it("preserves existing updates and permissions subcommand behavior alongside tool-activity", async () => {
 		const { pi, ctx } = await load("parent");
 		const { loadConfig } = await import("../src/config.js");
-		const command = pi.commands.get("antigravity-acp")!;
+		const command = pi.commands.get("pi-antigravity-acp")!;
 
 		await command.handler("tool-activity off", ctx as never);
 		await command.handler("updates notify", ctx as never);
@@ -210,7 +244,7 @@ describe("live quota", () => {
 		const { pi, ctx } = await load("a");
 		const quota = (await spyQuota()).mockResolvedValue(snapshot);
 
-		await pi.commands.get("antigravity-acp")!.handler("quota", ctx as never);
+		await pi.commands.get("pi-antigravity-acp")!.handler("quota", ctx as never);
 		expect(quota).toHaveBeenCalled();
 		expect(ctx.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("Gemini Models: weekly 75% (resets 2026-01-12T18:00:00.000Z), 5h 90% (resets 2026-01-08T04:30:00.000Z)"),
@@ -228,7 +262,7 @@ describe("live quota", () => {
 		const { pi, ctx } = await load("a");
 		(await spyQuota()).mockResolvedValue(snapshot);
 
-		await pi.commands.get("antigravity-acp")!.handler("quota", ctx as never);
+		await pi.commands.get("pi-antigravity-acp")!.handler("quota", ctx as never);
 
 		expect(ctx.ui.notify).toHaveBeenCalledWith(
 			expect.stringContaining("Other: no percentage limits reported"),
@@ -242,7 +276,7 @@ describe("live quota", () => {
 			new AntigravityAcpError("protocol", "Antigravity /usage reply had no quota groups: Unable to retrieve quota status (backend unavailable)"),
 		);
 
-		await pi.commands.get("antigravity-acp")!.handler("quota", ctx as never);
+		await pi.commands.get("pi-antigravity-acp")!.handler("quota", ctx as never);
 
 		const text = ctx.ui.notify.mock.calls.at(-1)![0] as string;
 		expect(text).toContain("Antigravity quota: unavailable (");
