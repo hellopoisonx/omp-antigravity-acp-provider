@@ -58,8 +58,10 @@ async function load(sessionId: string, events?: FakeExtensionApi["api"]["events"
 	const pi = createFakeExtensionApi(registry);
 	if (events) pi.api.events = events;
 	registerAntigravityAcp(pi.api, (options) => {
-		const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
-			args: [fakeAgent], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
+		const connection = new AntigravityAcpConnection({
+			...options, command: process.execPath,
+			args: [fakeAgent], env: { ...process.env, FAKE_AGENT_LOG_FILE: log }
+		});
 		connections.push(connection);
 		return connection;
 	});
@@ -88,6 +90,21 @@ describe("extension entry point", () => {
 		expect([...pi.commands.keys()]).toEqual(["pi-antigravity-acp"]);
 	});
 
+	it("completes arguments on the command without opening an ACP connection", async () => {
+		const { pi, ctx } = await load("parent");
+		const command = pi.commands.get("pi-antigravity-acp")!;
+		expect(await command.getArgumentCompletions!("tool-activity f")).toEqual([
+			{ value: "tool-activity full", label: "full" },
+		]);
+		expect(await command.getArgumentCompletions!("doctor --v")).toEqual([
+			{ value: "doctor --verbose", label: "--verbose" },
+		]);
+		expect(connections).toHaveLength(0);
+		const items = (await command.getArgumentCompletions!("tool-activity o"))!;
+		await command.handler(items[0]!.value, ctx as never);
+		expect(ctx.ui.notify).toHaveBeenCalledWith("Antigravity tool activity: off", "info");
+	});
+
 	it("registers OMP's two-argument provider config with effort thinking and a managed key", async () => {
 		vi.resetModules();
 		// A fresh module graph is the point: the extension caches state per load.
@@ -101,8 +118,10 @@ describe("extension entry point", () => {
 			},
 		});
 		registerAntigravityAcp(pi.api, (options) => {
-			const connection = new AntigravityAcpConnection({ ...options, command: process.execPath,
-				args: [fakeAgent], env: { ...process.env, FAKE_AGENT_LOG_FILE: log } });
+			const connection = new AntigravityAcpConnection({
+				...options, command: process.execPath,
+				args: [fakeAgent], env: { ...process.env, FAKE_AGENT_LOG_FILE: log }
+			});
 			connections.push(connection);
 			return connection;
 		});
@@ -118,8 +137,85 @@ describe("extension entry point", () => {
 			(entry) => entry.thinking?.mode === "effort" && entry.thinking.efforts.includes("low"),
 		)).toBe(true);
 		expect(registration?.config.oauth.getApiKey()).toBe(MANAGED_AUTH_MARKER);
+		expect(registration?.config.usage.id).toBe("antigravity-acp");
 		expect(pi.tools.get(PERMISSION_TOOL_NAME)).toMatchObject({ loadMode: "essential", intent: "omit" });
 	});
+
+	it("exposes live Antigravity quota through OMP's UsageProvider", async () => {
+		vi.resetModules();
+		const { registerAntigravityAcp } = await import("../extensions/index.js");
+		const { AntigravityRuntime } = await import("../src/runtime.js");
+		const pi = createFakeExtensionApi(registry);
+		const registered: Array<{ name: string; config: OmpProviderConfig }> = [];
+		Object.assign(pi.api, {
+			registerProvider: (name: string, config: OmpProviderConfig) => {
+				registered.push({ name, config });
+			},
+		});
+		const quotaSpy = vi.spyOn(AntigravityRuntime.prototype, "quota").mockResolvedValue(parseUsageQuota(usageReply, now));
+		registerAntigravityAcp(pi.api);
+		const ctx = createFakeContext({ sessionId: "omp-usage", cwd: root });
+		loaded.push({ pi, ctx });
+
+		const usageProvider = registered[0]!.config.usage;
+		const report = await usageProvider.fetchUsage({
+			provider: "antigravity-acp",
+			credential: { type: "api_key", apiKey: MANAGED_AUTH_MARKER, email: "user@example.com", accountId: "acc-1" },
+		});
+
+		expect(quotaSpy).toHaveBeenCalledWith(MANAGED_AUTH_MARKER, undefined);
+		expect(report).toMatchObject({
+			provider: "antigravity-acp",
+			fetchedAt: now,
+			metadata: { email: "user@example.com", accountId: "acc-1" },
+		});
+		expect(report?.limits).toEqual([
+			{
+				id: "antigravity-acp:gemini-models:weekly",
+				label: "Gemini Models",
+				scope: { provider: "antigravity-acp", tier: "Gemini Models", windowId: "weekly", accountId: "acc-1" },
+				window: { id: "weekly", label: "Weekly", durationMs: 7 * 86_400_000, resetsAt: Date.parse("2026-01-12T18:00:00.000Z") },
+				amount: { unit: "percent", usedFraction: 0.25, remainingFraction: 0.75, used: 25, remaining: 75, limit: 100 },
+				status: "ok",
+			},
+			{
+				id: "antigravity-acp:gemini-models:5h",
+				label: "Gemini Models",
+				scope: { provider: "antigravity-acp", tier: "Gemini Models", windowId: "5h", accountId: "acc-1" },
+				window: { id: "5h", label: "5 Hour", durationMs: 5 * 3_600_000, resetsAt: Date.parse("2026-01-08T04:30:00.000Z") },
+				amount: { unit: "percent", usedFraction: 0.1, remainingFraction: 0.9, used: 10, remaining: 90, limit: 100 },
+				status: "ok",
+			},
+			{
+				id: "antigravity-acp:claude-and-gpt-models:weekly",
+				label: "Claude and GPT models",
+				scope: { provider: "antigravity-acp", tier: "Claude and GPT models", windowId: "weekly", accountId: "acc-1" },
+				window: { id: "weekly", label: "Weekly", durationMs: 7 * 86_400_000, resetsAt: Date.parse("2026-01-14T09:15:00.000Z") },
+				amount: { unit: "percent", usedFraction: 0.4, remainingFraction: 0.6, used: 40, remaining: 60, limit: 100 },
+				status: "ok",
+			},
+			{
+				id: "antigravity-acp:claude-and-gpt-models:5h",
+				label: "Claude and GPT models",
+				scope: { provider: "antigravity-acp", tier: "Claude and GPT models", windowId: "5h", accountId: "acc-1" },
+				window: { id: "5h", label: "5 Hour", durationMs: 5 * 3_600_000, resetsAt: Date.parse("2026-01-08T06:45:00.000Z") },
+				amount: { unit: "percent", usedFraction: 0, remainingFraction: 1, used: 0, remaining: 100, limit: 100 },
+				status: "ok",
+			},
+			{
+				id: "antigravity-acp:gemini-4-argon:weekly",
+				label: "Gemini 4 Argon",
+				scope: { provider: "antigravity-acp", tier: "Gemini 4 Argon", windowId: "weekly", accountId: "acc-1" },
+				window: { id: "weekly", label: "Weekly", durationMs: 7 * 86_400_000, resetsAt: Date.parse("2026-01-13T12:00:00.000Z") },
+				amount: { unit: "percent", usedFraction: 0.6, remainingFraction: 0.4, used: 60, remaining: 40, limit: 100 },
+				status: "ok",
+			},
+		]);
+
+		quotaSpy.mockResolvedValueOnce({ at: now, groups: [{ displayName: "Other", buckets: [] }] });
+		expect(await usageProvider.fetchUsage({ provider: "antigravity-acp", credential: { type: "oauth" } })).toBeNull();
+	});
+
 
 	it("keeps the parent session usable after a child instance shuts down", async () => {
 		await load("parent");
@@ -234,7 +330,7 @@ describe("extension entry point", () => {
 		expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(["Antigravity runtime updates: notify", "info"]);
 		await command.handler("permissions auto-edit", ctx as never);
 		expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(["Antigravity permission mode: auto-edit.", "info"]);
-		expect(loadConfig()).toEqual({ permissions: "auto_edit", runtimeUpdates: "notify", toolActivity: "off" });
+		expect(loadConfig()).toEqual({ permissions: "auto_edit", runtimeUpdates: "notify", toolActivity: "off", nativeWorkflows: false });
 	});
 });
 

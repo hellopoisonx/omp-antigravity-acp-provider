@@ -27,7 +27,7 @@ describe("AntigravityAcpConnection", () => {
 		}
 	});
 
-	it("opens a session with no `_meta` routing: the tool channel is argv, not metadata", async () => {
+	it("opens a session with only native-workflow tool filter in `_meta`: the tool channel is argv", async () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agy-modern-"));
 		const log = path.join(directory, "agent.log");
 		const connection = new AntigravityAcpConnection({
@@ -45,7 +45,7 @@ describe("AntigravityAcpConnection", () => {
 				.map((line) => JSON.parse(line) as { method: string; params?: { mcpServers?: unknown; _meta?: unknown } })
 				.find((entry) => entry.method === "session/new");
 			expect(created?.params?.mcpServers).toEqual([]);
-			expect(created?.params?._meta).toBeUndefined();
+			expect(created?.params?._meta).toEqual({ antigravity: { disabledTools: ["run_workflow"] } });
 		} finally {
 			fs.rmSync(directory, { recursive: true, force: true });
 			await connection.close();
@@ -248,8 +248,10 @@ describe("AntigravityAcpConnection", () => {
 	});
 
 	it.each(["stream progress", "native work"])("keeps an active %s turn alive beyond the idle budget", async (text) => {
-		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), command: process.execPath,
-			args: [fakeAgent], env: { ...process.env, FAKE_PROGRESS_STEP_MS: "60" }, promptIdleTimeoutMs: 300, promptWorkIdleTimeoutMs: 1500 });
+		const connection = new AntigravityAcpConnection({
+			cwd: process.cwd(), command: process.execPath,
+			args: [fakeAgent], env: { ...process.env, FAKE_PROGRESS_STEP_MS: "60" }, promptIdleTimeoutMs: 300, promptWorkIdleTimeoutMs: 1500
+		});
 		try {
 			const session = await connection.newSession(process.cwd());
 			expect((await connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text }] })).stopReason).toBe("end_turn");
@@ -258,8 +260,10 @@ describe("AntigravityAcpConnection", () => {
 	});
 
 	it("bounds native tools that never report completion", async () => {
-		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), command: process.execPath,
-			args: [fakeAgent], promptIdleTimeoutMs: 300, promptWorkIdleTimeoutMs: 600 });
+		const connection = new AntigravityAcpConnection({
+			cwd: process.cwd(), command: process.execPath,
+			args: [fakeAgent], promptIdleTimeoutMs: 300, promptWorkIdleTimeoutMs: 600
+		});
 		try {
 			const session = await connection.newSession(process.cwd());
 			await expect(connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "native stuck" }] })).rejects.toThrow("no tool/permission progress for 600ms");
@@ -269,8 +273,10 @@ describe("AntigravityAcpConnection", () => {
 	});
 
 	it("holds a parked Pi call until release, then detects a silent prompt", async () => {
-		const connection = new AntigravityAcpConnection({ cwd: process.cwd(), command: process.execPath,
-			args: [fakeAgent], promptIdleTimeoutMs: 100, promptWorkIdleTimeoutMs: 1000 });
+		const connection = new AntigravityAcpConnection({
+			cwd: process.cwd(), command: process.execPath,
+			args: [fakeAgent], promptIdleTimeoutMs: 100, promptWorkIdleTimeoutMs: 1000
+		});
 		try {
 			const session = await connection.newSession(process.cwd());
 			const pending = connection.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "hang" }] });
@@ -311,8 +317,10 @@ describe("AntigravityAcpConnection", () => {
 	});
 
 	describe("when agy silently retries 429 RESOURCE_EXHAUSTED", () => {
-		const exhaustedAgent = (stepMs = 20) => new AntigravityAcpConnection({ cwd: process.cwd(), command: process.execPath,
-			args: [fakeAgent, "resource-exhausted"], env: { ...process.env, FAKE_RETRY_STEP_MS: String(stepMs) } });
+		const exhaustedAgent = (stepMs = 20) => new AntigravityAcpConnection({
+			cwd: process.cwd(), command: process.execPath,
+			args: [fakeAgent, "resource-exhausted"], env: { ...process.env, FAKE_RETRY_STEP_MS: String(stepMs) }
+		});
 		const prompt = (connection: AntigravityAcpConnection, sessionId: string, text: string, signal?: AbortSignal) =>
 			connection.prompt({ sessionId, prompt: [{ type: "text", text }] }, signal);
 

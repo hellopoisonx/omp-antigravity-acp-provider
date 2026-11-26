@@ -51,7 +51,7 @@ for await (const line of rl) {
 	}
 	const { id, method, params } = message;
 	if (process.env.FAKE_AGENT_LOG_FILE && method) fs.appendFileSync(process.env.FAKE_AGENT_LOG_FILE,
-		JSON.stringify({ method, ...(method === "initialize" || method === "session/new" ? { params } : {}), ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
+		JSON.stringify({ method, ...(["initialize", "session/new", "session/load", "session/resume"].includes(method) ? { params } : {}), ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
 	if (id === "mixed-permission" && method === undefined) {
 		resolveMixedPermission?.(message.result?.outcome?.optionId ?? message.result?.outcome?.outcome ?? "cancelled");
 		resolveMixedPermission = undefined;
@@ -160,7 +160,8 @@ for await (const line of rl) {
 			for (const suffix of [".db", ".db-shm", ".db-wal"]) fs.writeFileSync(path.join(conversations, sessionId + suffix), "");
 			fs.writeFileSync(path.join(conversations, `${sessionId}.meta`), JSON.stringify({ cwd: params.cwd }));
 		}
-		if (process.env.FAKE_AGENT_WRITE_RUN_WORKFLOW === "1" && params.cwd) {
+		if (process.env.FAKE_AGENT_WRITE_RUN_WORKFLOW === "1" && params.cwd &&
+			!params._meta?.antigravity?.disabledTools?.includes("run_workflow")) {
 			const skillDir = path.join(params.cwd, "skills", "system", "run-workflow");
 			const skillFile = path.join(skillDir, "SKILL.md");
 			if (!fs.existsSync(skillFile)) {
@@ -249,17 +250,25 @@ for await (const line of rl) {
 		const continuing = params.prompt.some((block) => block.type === "text" && block.text.includes("Continue the current Pi user request"));
 		if (continuing && scenario?.startsWith("late-")) {
 			const results = params.prompt.filter((block) => block.type === "resource").map((block) => block.resource.text).join("\n");
-			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId,
-				update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: results } } } });
+			send({
+				jsonrpc: "2.0", method: "session/update", params: {
+					sessionId: params.sessionId,
+					update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: results } }
+				}
+			});
 			if (scenario === "late-hang") hangingPromptId = id;
 			else send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
 		if (scenario === "mode-drift" || scenario === "config-options-mode-drift") {
 			mode = "yolo";
-			send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId,
-				update: modern ? { sessionUpdate: "config_option_update", configOptions: sessionConfigOptions() }
-					: { sessionUpdate: "current_mode_update", currentModeId: mode } } });
+			send({
+				jsonrpc: "2.0", method: "session/update", params: {
+					sessionId: params.sessionId,
+					update: modern ? { sessionUpdate: "config_option_update", configOptions: sessionConfigOptions() }
+						: { sessionUpdate: "current_mode_update", currentModeId: mode }
+				}
+			});
 		}
 		if (text === "stream progress" || text === "native work" || text === "native stuck") {
 			hangingPromptId = id;
@@ -310,14 +319,16 @@ for await (const line of rl) {
 			// native action before that call returns. Both answers are needed to finish the prompt.
 			const decision = new Promise((resolve) => { resolveMixedPermission = resolve; });
 			const bridge = invokeMcpTool(bridgeTarget, "from gemini", () => {
-				setTimeout(() => send({ jsonrpc: "2.0", id: "mixed-permission", method: "session/request_permission", params: {
-					sessionId: params.sessionId,
-					toolCall: { toolCallId: "native-tool-2", title: "Run native command", kind: "execute" },
-					options: [
-						{ optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-						{ optionId: "reject-once", name: "Reject", kind: "reject_once" },
-					],
-				} }), 20);
+				setTimeout(() => send({
+					jsonrpc: "2.0", id: "mixed-permission", method: "session/request_permission", params: {
+						sessionId: params.sessionId,
+						toolCall: { toolCallId: "native-tool-2", title: "Run native command", kind: "execute" },
+						options: [
+							{ optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+							{ optionId: "reject-once", name: "Reject", kind: "reject_once" },
+						],
+					}
+				}), 20);
 			});
 			void Promise.all([bridge, decision]).then(([result, choice]) => {
 				notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${result}|${choice}` } });
@@ -332,13 +343,13 @@ for await (const line of rl) {
 			if (reportUsage) { usageUpdate(0); usageUpdate(1000); }
 			const invocation = text.includes("parallel")
 				? Promise.all([
-						text.includes("reversed")
-							? new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "first"))
-							: invokeMcpTool(bridgeTarget, "first"),
-						text.includes("reversed")
-							? invokeMcpTool(bridgeTarget, "second")
-							: new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "second")),
-					]).then((results) => results.join(","))
+					text.includes("reversed")
+						? new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "first"))
+						: invokeMcpTool(bridgeTarget, "first"),
+					text.includes("reversed")
+						? invokeMcpTool(bridgeTarget, "second")
+						: new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(bridgeTarget, "second")),
+				]).then((results) => results.join(","))
 				: invokeMcpTool(bridgeTarget, "from gemini", () => {
 					if (scenario !== "early-tool-turn-end") return;
 					setTimeout(() => {
@@ -361,8 +372,12 @@ for await (const line of rl) {
 						update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: result } },
 					},
 				});
-				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn",
-					...(reportUsage ? { usage: { inputTokens: 2400, outputTokens: 200, totalTokens: 2600 } } : {}) } });
+				send({
+					jsonrpc: "2.0", id, result: {
+						stopReason: "end_turn",
+						...(reportUsage ? { usage: { inputTokens: 2400, outputTokens: 200, totalTokens: 2600 } } : {})
+					}
+				});
 			}).catch(() => undefined);
 			continue;
 		}
@@ -390,11 +405,13 @@ for await (const line of rl) {
 						progressed = true;
 						attempt = 0;
 					};
-					send({ jsonrpc: "2.0", id: "exhausted-permission", method: "session/request_permission", params: {
-						sessionId: params.sessionId,
-						toolCall: { toolCallId: "native-tool-1", title: "Run native command", kind: "execute" },
-						options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],
-					} });
+					send({
+						jsonrpc: "2.0", id: "exhausted-permission", method: "session/request_permission", params: {
+							sessionId: params.sessionId,
+							toolCall: { toolCallId: "native-tool-1", title: "Run native command", kind: "execute" },
+							options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],
+						}
+					});
 					return;
 				}
 				if (attempt === retries && !progressed) {
@@ -426,12 +443,20 @@ for await (const line of rl) {
 				method: "session/update",
 				params: {
 					sessionId: params.sessionId,
-					update: { sessionUpdate: "agent_message_chunk", content: { type: "text",
-						text: `Usage Limit Reached\n\nYou have reached your current quota for this period.${reset}` } },
+					update: {
+						sessionUpdate: "agent_message_chunk", content: {
+							type: "text",
+							text: `Usage Limit Reached\n\nYou have reached your current quota for this period.${reset}`
+						}
+					},
 				},
 			});
-			send({ jsonrpc: "2.0", id, result: { stopReason: text.includes("refusal") ? "refusal" : "end_turn",
-				...(text.includes("refusal") || text.includes("quoted") ? { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } : {}) } });
+			send({
+				jsonrpc: "2.0", id, result: {
+					stopReason: text.includes("refusal") ? "refusal" : "end_turn",
+					...(text.includes("refusal") || text.includes("quoted") ? { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } : {})
+				}
+			});
 			continue;
 		}
 		if (text.startsWith("usage multi")) {
@@ -441,9 +466,15 @@ for await (const line of rl) {
 			usageUpdate(0);
 			for (const context of inputs) usageUpdate(context);
 			notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done" } });
-			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn",
-				usage: { inputTokens: inputs.reduce((sum, context) => sum + context - 1000, 0),
-					cachedReadTokens, outputTokens: 4000, totalTokens: inputs.reduce((sum, context) => sum + context, 0) } } });
+			send({
+				jsonrpc: "2.0", id, result: {
+					stopReason: "end_turn",
+					usage: {
+						inputTokens: inputs.reduce((sum, context) => sum + context - 1000, 0),
+						cachedReadTokens, outputTokens: 4000, totalTokens: inputs.reduce((sum, context) => sum + context, 0)
+					}
+				}
+			});
 			continue;
 		}
 		if (text.startsWith("usage capture ")) {
@@ -458,22 +489,34 @@ for await (const line of rl) {
 		}
 		if (text === "usage overflow error") {
 			usageUpdate(270000);
-			send({ jsonrpc: "2.0", id, error: { code: -32603,
-				message: "The input token count (1100000) exceeds the maximum number of tokens allowed (1000000)" } });
+			send({
+				jsonrpc: "2.0", id, error: {
+					code: -32603,
+					message: "The input token count (1100000) exceeds the maximum number of tokens allowed (1000000)"
+				}
+			});
 			continue;
 		}
 		if (text === "usage single") {
 			usageUpdate(1600);
 			notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } });
-			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn",
-				usage: { inputTokens: 1000, cachedReadTokens: 400, outputTokens: 150, thoughtTokens: 50, totalTokens: 1200 } } });
+			send({
+				jsonrpc: "2.0", id, result: {
+					stopReason: "end_turn",
+					usage: { inputTokens: 1000, cachedReadTokens: 400, outputTokens: 150, thoughtTokens: 50, totalTokens: 1200 }
+				}
+			});
 			continue;
 		}
 		if (text === "usage single net" || text === "usage single net drift") {
 			usageUpdate(text.endsWith("drift") ? 1300 : 1200);
 			notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } });
-			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn",
-				usage: { inputTokens: 600, cachedReadTokens: 400, outputTokens: 200, thoughtTokens: 50, totalTokens: 1200 } } });
+			send({
+				jsonrpc: "2.0", id, result: {
+					stopReason: "end_turn",
+					usage: { inputTokens: 600, cachedReadTokens: 400, outputTokens: 200, thoughtTokens: 50, totalTokens: 1200 }
+				}
+			});
 			continue;
 		}
 		if (!continuing && text.includes("hang")) {
@@ -536,9 +579,11 @@ function finishBeforePiResult(id) {
 	setTimeout(() => {
 		bridgePromptId = undefined;
 		permissionPromptId = undefined;
-		send({ jsonrpc: "2.0", id, ...(scenario === "late-error"
-			? { error: { code: -32603, message: "Prompt ended before the Pi result" } }
-			: { result: { stopReason: "end_turn" } }) });
+		send({
+			jsonrpc: "2.0", id, ...(scenario === "late-error"
+				? { error: { code: -32603, message: "Prompt ended before the Pi result" } }
+				: { result: { stopReason: "end_turn" } })
+		});
 	}, 350);
 }
 
@@ -554,16 +599,24 @@ function sessionModes(restored = false) {
 
 function sessionConfigOptions() {
 	return [
-		{ id: "model-selector", name: "Model", category: "model", type: "select", currentValue: model,
-			options: [{ group: "google", name: "Google", options: [
-				{ value: "auto", name: "Auto" }, { value: "gemini-test", name: "Gemini Test" },
-			] }] },
+		{
+			id: "model-selector", name: "Model", category: "model", type: "select", currentValue: model,
+			options: [{
+				group: "google", name: "Google", options: [
+					{ value: "auto", name: "Auto" }, { value: "gemini-test", name: "Gemini Test" },
+				]
+			}]
+		},
 		...(effortSelector || (scenario === "config-options-disappearing-thought" && model === "auto")
-			? [{ id: "thinking-level-selector", name: "Thinking", category: "thought_level", type: "select",
-				currentValue: effort, options: ["low", "medium", "high"].map((value) => ({ value, name: value })) }]
+			? [{
+				id: "thinking-level-selector", name: "Thinking", category: "thought_level", type: "select",
+				currentValue: effort, options: ["low", "medium", "high"].map((value) => ({ value, name: value }))
+			}]
 			: []),
-		{ id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
-			options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value })) },
+		{
+			id: "permission-selector", name: "Permissions", category: "mode", type: "select", currentValue: mode,
+			options: ["default", "auto_edit", "yolo"].map((value) => ({ value, name: value }))
+		},
 	];
 }
 
