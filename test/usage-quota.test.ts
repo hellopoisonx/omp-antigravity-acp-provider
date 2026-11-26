@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { describe, expect, it } from "vitest";
-import { parseUsageQuota } from "../src/acp/usage-quota.js";
+import { parseCliUsageQuota, parseUsageQuota } from "../src/acp/usage-quota.js";
 
 const reply = fs.readFileSync(new URL("./fixtures/usage-reply.md", import.meta.url), "utf8");
 const now = 1_800_000_000_000;
@@ -53,5 +53,42 @@ describe("parseUsageQuota", () => {
 		expect(() => parseUsageQuota(unavailable("- Not applicable for current authentication method."), now))
 			.toThrow("Not applicable for current authentication method.");
 		expect(() => parseUsageQuota("Hello", now)).toThrow("no quota groups");
+	});
+});
+
+describe("parseCliUsageQuota", () => {
+	it("parses tab-separated agy -p /usage output and drops epoch-zero reset timers", () => {
+		const output = [
+			"Gemini Models\tWeekly Limit Remaining\t78%\t2026-12-02T04:24:23Z",
+			"Gemini Models\tFive Hour Limit Remaining\t69%\t2026-11-26T05:56:25Z",
+			"Claude and GPT models\tWeekly Limit Remaining\t100%\t1970-01-01T00:00:00Z",
+			"Claude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z",
+		].join("\n");
+		expect(parseCliUsageQuota(output, now)).toEqual({
+			at: now,
+			groups: [
+				{
+					displayName: "Gemini Models",
+					buckets: [
+						{ window: "weekly", remainingFraction: 0.78, resetTime: "2026-12-02T04:24:23.000Z" },
+						{ window: "5h", remainingFraction: 0.69, resetTime: "2026-11-26T05:56:25.000Z" },
+					],
+				},
+				{
+					displayName: "Claude and GPT models",
+					buckets: [
+						{ window: "weekly", remainingFraction: 1 },
+						{ window: "5h", remainingFraction: 1 },
+					],
+				},
+			],
+		});
+	});
+
+	it("rejects empty or invalid CLI /usage output", () => {
+		expect(() => parseCliUsageQuota("", now)).toThrow("no quota groups: empty");
+		expect(() => parseCliUsageQuota("Gemini Models\tWeekly\t2026-12-02T04:24:23Z", now)).toThrow("no quota groups");
+		expect(() => parseCliUsageQuota("Gemini Models\tWeekly\t105%\t2026-12-02T04:24:23Z", now)).toThrow("invalid percentage");
+		expect(() => parseCliUsageQuota("Gemini Models\tWeekly\t50%\tnot-a-date", now)).toThrow("invalid reset time");
 	});
 });

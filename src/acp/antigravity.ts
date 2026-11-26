@@ -166,6 +166,10 @@ export function clearAntigravityCredentials(
 }
 
 const AGY_CLI_NAME = /^agy(?:\.exe)?$/iu;
+export function isAgyCliCommand(command: string): boolean {
+	return AGY_CLI_NAME.test(path.basename(command));
+}
+
 
 /** The single-binary `agy` CLI serves the same ACP agent through a subcommand and
  * keeps its credential store under the same app data dir as the archive build.

@@ -322,7 +322,7 @@ function toOmpUsageWindow(windowName: string, resetTime: string | undefined): Om
 		descriptor = { id: slugify(windowName), label: windowName };
 	}
 	const resetsAt = resetTime ? Date.parse(resetTime) : Number.NaN;
-	if (Number.isFinite(resetsAt)) descriptor.resetsAt = resetsAt;
+	if (Number.isFinite(resetsAt) && resetsAt > 0) descriptor.resetsAt = resetsAt;
 	return descriptor;
 }
 

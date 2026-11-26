@@ -17,20 +17,26 @@ import {
 } from "@earendil-works/pi-ai";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 import {
 	clearAntigravityCredentials,
 	inspectAntigravityAuth,
+	isAgyCliCommand,
 	removeConversation,
+	resolveAntigravityAcpLaunch,
 	type AntigravityAuthHealth,
 } from "./acp/antigravity.js";
 import { prepareAgentWorkspace } from "./acp/agent.js";
 import { AntigravityAcpConnection, type AntigravityConnectionOptions } from "./acp/connection.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
+import { applyCredentialStorageEnvironment } from "./acp/credential-storage.js";
+import { applyAcpProxyEnvironment } from "./acp/proxy.js";
 import { quotaExhaustion } from "./acp/quota.js";
 import { AcpSessionStore } from "./acp/session-store.js";
 import { sessionModels, sessionModes, type AcpModelInfo, type AcpNewSessionResponse, type SessionState } from "./acp/session-state.js";
-import { parseUsageQuota, type AntigravityQuotaSnapshot } from "./acp/usage-quota.js";
+import { parseCliUsageQuota, parseUsageQuota, type AntigravityQuotaSnapshot } from "./acp/usage-quota.js";
 import {
 	DEFAULT_BINDING_IDLE_MS,
 	DEFAULT_MAX_BINDINGS,
@@ -65,6 +71,7 @@ const TOOL_LIST_WAIT_MS = 20_000;
 const TOOL_BATCH_MS = 100;
 const QUOTA_CACHE_MS = 60_000;
 const QUOTA_TIMEOUT_MS = 30_000;
+const execFileAsync = promisify(execFile);
 
 type AntigravityModel = Model<"antigravity-acp">;
 
@@ -315,6 +322,10 @@ export class AntigravityRuntime {
 		const epoch = this.bindingEpoch;
 		if (this.ensureAgent) await ensureAntigravityAcpReady();
 		this.assertEpoch(epoch);
+		if (this.ensureAgent && (!apiKey || apiKey === MANAGED_AUTH_MARKER)) {
+			const launch = resolveAntigravityAcpLaunch();
+			if (isAgyCliCommand(launch.command)) return await fetchCliUsageQuota(launch.command);
+		}
 		let sessionId: string | undefined;
 		let text = "";
 		const cwd = resolveUtilityCwd();
@@ -1319,6 +1330,20 @@ function positiveInt(value: number | string | undefined, fallback: number, minim
 	if (value === undefined || value === "") return fallback;
 	const parsed = typeof value === "number" ? value : Number(value);
 	return Number.isFinite(parsed) && parsed >= minimum ? Math.floor(parsed) : fallback;
+}
+
+async function fetchCliUsageQuota(command: string): Promise<AntigravityQuotaSnapshot> {
+	const cwd = prepareAgentWorkspace(resolveUtilityCwd());
+	const env = applyCredentialStorageEnvironment(applyAcpProxyEnvironment(process.env));
+	const { stdout } = await execFileAsync(command, ["--app_data_dir=antigravity-acp", "-p", "/usage"], {
+		cwd,
+		env,
+		encoding: "utf8",
+		timeout: QUOTA_TIMEOUT_MS,
+		maxBuffer: 1024 * 1024,
+		windowsHide: true,
+	});
+	return parseCliUsageQuota(stdout);
 }
 
 async function authenticateForCredential(
